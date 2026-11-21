@@ -71,12 +71,12 @@ void read_clicks(const Input& input, Window w, const Dates& dt, Keys& keys, cons
     jobs(input.chunks.size(), bins.size(), [&](unsigned lane, size_t i) {
         rows<4>(input.chunks[i], [&](const auto& f) {
             if (f[0].empty() || f[1].empty()) return;
-            auto ad = dim.campaign.find(f[2]);
-            if (ad == dim.campaign.end()) return;
+            uint32_t ad = dim.campaign_index(f[2]);
+            if (ad == UINT32_MAX) return;
             int64_t ts = dt.parse(f[3]);
             if (ts < w.start - week_ms || ts >= w.end) return;
             Key person = people.canonical(keys.encode(f[1]));
-            bins[lane][shard(person)].push_back({person, ts, keys.encode(f[0]), ad->second});
+            bins[lane][shard(person)].push_back({person, ts, keys.encode(f[0]), ad});
         });
     });
 }

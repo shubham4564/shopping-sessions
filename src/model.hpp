@@ -4,13 +4,19 @@
 namespace shop {
 class People {
     struct Slot {
-        Key id = 0, value = 0;
+        Key id, value;
     };
     struct Component {
         uint32_t parent, count;
         Key name;
     };
-    std::vector<Slot> table_;
+    struct UnmapSlots {
+        size_t bytes;
+        void operator()(Slot* p) const { munmap(p, bytes); }
+    };
+    using SlotStorage = std::unique_ptr<Slot[], UnmapSlots>;
+    SlotStorage storage_{nullptr, UnmapSlots{0}};
+    std::span<Slot> table_;
     std::vector<Component> nodes_;
     struct alignas(64) ShardSize {
         std::atomic<uint32_t> count{0};
@@ -46,8 +52,20 @@ class People {
         return at;
     }
     void resize(size_t n) {
-        auto old = std::move(table_);
-        table_.assign(n, {});
+        if (n > SIZE_MAX / sizeof(Slot))
+            throw std::bad_alloc();
+        size_t bytes = n * sizeof(Slot);
+        void* mem = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mem == MAP_FAILED)
+            throw std::bad_alloc();
+        madvise(mem, bytes, MADV_HUGEPAGE);
+        // Anonymous pages start at zero. Start the trivial objects' lifetimes
+        // without touching all pages on the graph coordinator thread.
+        SlotStorage fresh(::new (mem) Slot[n], UnmapSlots{bytes});
+        auto previous = std::move(storage_);
+        auto old = table_;
+        storage_ = std::move(fresh);
+        table_ = {storage_.get(), n};
         mask_ = n - 1;
         for (auto slot : old)
             if (slot.id)
@@ -326,36 +344,40 @@ struct Dimensions {
         return n;
     }
     Dimensions(const Input& products, const Input& ads) {
+        std::unordered_map<View, uint32_t> category_numbers{{"unknown", 0}};
         categories.push_back("unknown");
-        std::unordered_map<View, uint32_t> ranks;
-        for (View chunk : products.chunks)
+        std::vector<std::pair<View, uint32_t>> products_and_categories;
+        for (View chunk : products.chunks) {
             rows<2>(chunk, [&](const auto& f) {
-                if (ranks.try_emplace(f[1], 0).second)
+                auto [it, added] = category_numbers.try_emplace(f[1], category_numbers.size());
+                if (added)
                     categories.push_back(f[1]);
+                products_and_categories.emplace_back(f[0], it->second);
             });
-        std::sort(categories.begin(), categories.end());
-        categories.erase(std::unique(categories.begin(), categories.end()), categories.end());
-        for (uint32_t i = 0; i < categories.size(); ++i)
-            ranks[categories[i]] = i;
-        unknown = ranks.at("unknown");
-        for (View chunk : products.chunks)
-            rows<2>(chunk, [&](const auto& f) { product.emplace(f[0], ranks.at(f[1])); });
-        for (View chunk : ads.chunks)
-            rows<2>(chunk, [&](const auto& f) {
-                campaign.emplace(f[0], campaigns.size());
-                campaigns.push_back({f[0], f[1]});
-            });
-        numeric_product.assign(product.size() * 2 + 1, UINT32_MAX);
-        for (auto [k, v] : product) {
-            auto n = suffix(k, "p");
-            if (n < numeric_product.size())
-                numeric_product[n] = v;
         }
-        numeric_campaign.assign(campaign.size() * 2 + 1, UINT32_MAX);
-        for (auto [k, v] : campaign) {
-            auto n = suffix(k, "c_");
+        std::sort(categories.begin(), categories.end());
+        std::vector<uint32_t> rank(categories.size());
+        for (uint32_t i = 0; i < categories.size(); ++i)
+            rank[category_numbers.at(categories[i])] = i;
+        unknown = rank[0];
+        numeric_product.assign(products_and_categories.size() * 2 + 1, UINT32_MAX);
+        for (auto [id, category_number] : products_and_categories) {
+            uint32_t n = suffix(id, "p");
+            if (n < numeric_product.size())
+                numeric_product[n] = rank[category_number];
+            else
+                product.emplace(id, rank[category_number]);
+        }
+        for (View chunk : ads.chunks)
+            rows<2>(chunk, [&](const auto& f) { campaigns.push_back({f[0], f[1]}); });
+        numeric_campaign.assign((campaigns.size() - 1) * 2 + 1, UINT32_MAX);
+        for (uint32_t i = 1; i < campaigns.size(); ++i) {
+            View id = campaigns[i].id;
+            uint32_t n = suffix(id, "c_");
             if (n < numeric_campaign.size())
-                numeric_campaign[n] = v;
+                numeric_campaign[n] = i;
+            else
+                campaign.emplace(id, i);
         }
     }
     uint32_t category(View id) const {
