@@ -22,9 +22,10 @@ build/shopping-sessions: $(SOURCES) $(HEADERS)
 
 ARCH-base = -march=x86-64
 ARCH-avx2 = -march=x86-64-v3
-ARCH-avx512 = -march=x86-64-v4
-ARCH-vbmi2 = -march=x86-64-v4 -mavx512vbmi2
-VARIANTS = base avx2 avx512 vbmi2
+ARCH-avx512 = -march=x86-64-v4 -mtune=cascadelake
+ARCH-vbmi2 = -march=x86-64-v4 -mavx512vbmi2 -mtune=icelake-server
+ARCH-zen4 = -march=x86-64-v4 -mavx512vbmi2 -mtune=znver4
+VARIANTS = base avx2 avx512 vbmi2 zen4
 portable: build/portable/shopping-sessions $(addprefix build/portable/engine-,$(VARIANTS))
 
 build/portable/engine-%: $(SOURCES) $(HEADERS)

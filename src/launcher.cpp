@@ -8,7 +8,9 @@
 int main(int, char** argv) {
     const char* engine = "engine-base";
     if (__builtin_cpu_supports("x86-64-v4")) {
-        engine = __builtin_cpu_supports("avx512vbmi2") ? "engine-vbmi2" : "engine-avx512";
+        engine = "engine-avx512";
+        if (__builtin_cpu_supports("avx512vbmi2"))
+            engine = __builtin_cpu_is("amd") ? "engine-zen4" : "engine-vbmi2";
     } else if (__builtin_cpu_supports("x86-64-v3")) {
         engine = "engine-avx2";
     }

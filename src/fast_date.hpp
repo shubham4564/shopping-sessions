@@ -89,6 +89,38 @@ class Dates {
 #endif
         return parse(View(p, n));
     }
+#if defined(__AVX2__)
+    // Decode the event and its guaranteed-valid UTC ingestion timestamp in
+    // separate 128-bit lanes. The event still undergoes every grammar check.
+    void paired_utc(const char* event, const char* ingest, int64_t& ts, int64_t& ing) const {
+        const Month& m = months_[event[6] & 15];
+        if (read64(event) != m.prefix || read64(ingest) != m.prefix) {
+            ts = padded(event, 20);
+            ing = relative_ingest(ingest);
+            return;
+        }
+        auto first = _mm_loadu_si128(reinterpret_cast<const __m128i*>(event + 4));
+        auto second = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ingest + 4));
+        auto clocks = _mm256_inserti128_si256(_mm256_castsi128_si256(first), second, 1);
+        auto raw = _mm256_sub_epi8(clocks, _mm256_set1_epi8('0'));
+        auto order = _mm_setr_epi8(4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, -1, -1);
+        auto digits = _mm256_shuffle_epi8(raw, _mm256_broadcastsi128_si256(order));
+        auto pairs = _mm256_maddubs_epi16(digits, _mm256_set1_epi16(0x010a));
+        auto event_pairs = _mm256_castsi256_si128(pairs);
+        auto limits = _mm_setr_epi16(m.days, 23, 59, 59, 0, 0, 0, 0);
+        auto invalid = _mm_or_si128(_mm_subs_epu8(_mm256_castsi256_si128(digits), _mm_set1_epi8(9)),
+                                    _mm_cmpgt_epi16(event_pairs, limits));
+        auto factors = _mm_setr_epi16(24, 1, 60, 1, 0, 0, 0, 0);
+        auto totals = _mm256_madd_epi16(pairs, _mm256_broadcastsi128_si256(factors));
+        auto scaled = _mm256_mullo_epi32(totals, _mm256_setr_epi32(3600, 1, 0, 0, 3600, 1, 0, 0));
+        auto seconds = _mm256_add_epi32(scaled, _mm256_srli_si256(scaled, 4));
+        ing = m.relative_seconds + _mm256_extract_epi32(seconds, 4);
+        ts = m.base + int64_t(_mm256_extract_epi32(seconds, 0)) * 1000;
+        if (!_mm_testz_si128(invalid, invalid) || !_mm_extract_epi16(event_pairs, 0) ||
+            event[10] != 'T' || event[13] != ':' || event[16] != ':' || event[19] != 'Z')
+            ts = bad_time;
+    }
+#endif
     explicit Dates(Window w) : window_seconds_(w.start / 1000) {
         digits_.fill(255);
         for (int i = 0; i < 100; ++i)

@@ -18,7 +18,7 @@ docker run --rm --platform linux/amd64 --network none --read-only \
   shopping-sessions
 ```
 
-The entry point selects an x86-64 implementation from the CPU features available at runtime. It honors `DATA_DIR`, `OUTPUT_DIR`, and `NCPU`. Set `SHOP_TIMING=1` for cumulative stage times on stderr.
+The entry point checks CPU features at runtime. It selects a baseline, AVX2, or AVX-512 implementation and uses vendor-specific instruction scheduling on AVX-512 CPUs with VBMI2. It honors `DATA_DIR`, `OUTPUT_DIR`, and `NCPU`. Set `SHOP_TIMING=1` for cumulative stage times on stderr.
 
 ## Verify the tables
 
@@ -29,7 +29,7 @@ python3 -m pip install polars==1.32.3
 scripts/verify-container.sh
 ```
 
-For a local build, install GCC 12+, make, and the LZ4 runtime (`liblz4-1` on Debian). Set the paths to the unzipped starter, generated data, and official answer.
+For a local build, install GCC 14+, make, and the LZ4 runtime (`liblz4-1` on Debian). Set the paths to the unzipped starter, generated data, and official answer.
 
 ```sh
 make -j2 portable

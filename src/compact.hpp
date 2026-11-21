@@ -188,9 +188,6 @@ inline bool plain_event(const char* p, const char* end, unsigned a, unsigned b, 
     const char* t = raw_t + qt;
     if (t + n + qt + 22 > end || t[n + qt] != ',')
         return false;
-    int64_t ts = dt.padded(t, n);
-    if (ts == bad_time)
-        return false;
     const char* raw_i = t + n + qt + 1;
     unsigned qi = *raw_i == '"';
     const char* ip = raw_i + qi;
@@ -199,8 +196,14 @@ inline bool plain_event(const char* p, const char* end, unsigned a, unsigned b, 
     const char* raw_type = ip + 21 + qi;
     unsigned qkind = *raw_type == '"';
     const char* kind = raw_type + qkind;
-    int64_t ing = dt.relative_ingest(ip);
-    if (ing == bad_time)
+    int64_t ts, ing;
+    if constexpr (n == 20)
+        dt.paired_utc(t, ip, ts, ing);
+    else {
+        ts = dt.padded(t, n);
+        ing = dt.relative_ingest(ip);
+    }
+    if (ts == bad_time || ing == bad_time)
         return false;
     Key id = keys.clean(p + qe, a - 2 * qe), user = 0;
     if (!id)
