@@ -319,41 +319,6 @@ public:
 #endif
         return encode(View(p,n));
     }
-    Key clean_unordered(const char* p, size_t n) {
-#if defined(__BMI2__)
-        if (n <= 9) {
-            uint64_t w;
-            std::memcpy(&w, p, 8);
-            if (n == 9)
-                return _pext_u64(w, 0x7f7f7f7f7f7f7f7fULL) | (uint64_t(static_cast<unsigned char>(p[8])) << 56);
-            return _pext_u64(_bzhi_u64(w, unsigned(n * 8)), 0x7f7f7f7f7f7f7f7fULL);
-        }
-#endif
-        return encode_unordered(View(p, n));
-    }
-    Key encode_unordered(View s) {
-#if defined(__BMI2__)
-        if (s.size() == 9 || s.size() == 8) {
-            uint64_t word;
-            std::memcpy(&word, s.data(), 8);
-            constexpr uint64_t high = 0x8080808080808080ULL;
-            unsigned char ninth = s.size() == 9 ? s[8] : 1;
-            if (!((((word - 0x0101010101010101ULL) & ~word) | word) & high) &&
-                ninth && ninth < 128)
-                return _pext_u64(word, ~high) | (s.size() == 9 ? (uint64_t(ninth) << 56) : 0);
-        }
-#endif
-        if (s.size() <= 9) {
-            Key k = 0;
-            for (size_t i = 0; i < s.size(); ++i) {
-                unsigned char c = static_cast<unsigned char>(s[i]);
-                if (c == 0 || c >= 128) return intern(s);
-                k |= Key(c) << (7 * i);
-            }
-            return k;
-        }
-        return intern(s);
-    }
     Key encode(View s) {
 #if defined(__BMI2__)
         if (s.size() == 9 || s.size() == 8) {

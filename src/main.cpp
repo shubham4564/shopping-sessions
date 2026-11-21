@@ -278,8 +278,6 @@ int main(int argc, char** argv) {
         const char* output = argc > 2 ? argv[2] : env("OUTPUT_DIR", "/output");
         unsigned cpu = std::clamp(std::stoi(env("NCPU", "8")), 1, 64);
         shop::run(input, output, cpu);
-        std::cerr.flush();
-        _exit(0);
     } catch (const std::exception& e) {
         std::cerr << "shopping-sessions: " << e.what() << '\n';
         return 1;
