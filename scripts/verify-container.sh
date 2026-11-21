@@ -24,6 +24,8 @@ docker build --platform "$PLATFORM" -t "$IMAGE" "$repo"
 docker image inspect --format 'Image {{.Os}}/{{.Architecture}}, {{.Size}} bytes' "$IMAGE"
 runner="$work/starter-duckdb/scripts/docker_run.sh"
 python3 starter-duckdb/scripts/run_fixtures.py starter-duckdb/fixtures -- "$runner"
+python3 "$repo/tests/boundaries.py" "$runner"
+python3 "$repo/tests/dense.py" "$runner"
 cargo build --locked --release --manifest-path generator/Cargo.toml
 generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output dev
 "$runner" dev out

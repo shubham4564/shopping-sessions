@@ -1,10 +1,10 @@
 # Shopping Sessions
 
-A C++20 implementation of the Databricks Shopping Sessions buildathon. It reads the mounted CSVs and manifest and writes `user_daily/part-0.parquet` and `campaign_daily/part-0.parquet`. Both files include a Parquet DATE column and carry their full schema when empty.
+A C++20 implementation of the Databricks Shopping Sessions buildathon. It reads the mounted CSV files and manifest and writes eight Parquet parts in `user_daily/` and one in `campaign_daily/`. Both tables retain their schema on empty inputs.
 
 ## Build and run
 
-From the repository root on a Docker host, set `DATA` to the directory containing `manifest.json`. The output and scratch directories must be writable by UID 1000.
+From the repository root on a Docker host, set `DATA` to the directory containing `manifest.json`. Make the output and scratch directories writable by UID 1000.
 
 ```sh
 docker build --platform linux/amd64 -t shopping-sessions .
@@ -18,36 +18,44 @@ docker run --rm --platform linux/amd64 --network none --read-only \
   shopping-sessions
 ```
 
-The binary honors `DATA_DIR`, `OUTPUT_DIR`, and `NCPU`. Its default paths are `/data` and `/output`. It keeps its working data in memory. Set `SHOP_TIMING=1` to print cumulative stage times to stderr.
+The entry point selects an x86-64 implementation from the CPU features available at runtime. It honors `DATA_DIR`, `OUTPUT_DIR`, and `NCPU`. Set `SHOP_TIMING=1` for cumulative stage times on stderr.
 
-## Verify the submission
+## Verify the tables
 
-On a Linux Docker host with Rust 1.85+, Python, make, curl, and unzip, run the following. The script checks the downloaded archives, runs the container on all 36 official fixtures, generates the public seed-1 data, and runs `make check-dev` against both published answer tables.
+On a Linux Docker host with Rust 1.85+, Python, make, curl, and unzip, run the following. The script verifies archive checksums, checks all 36 official fixtures, exercises additional boundary cases, and compares both output tables with the published seed-1 answer.
 
 ```sh
 python3 -m pip install polars==1.32.3
 scripts/verify-container.sh
 ```
 
-For native testing on x86-64 Linux, install GCC 12+, make, and the specified Arrow wheel. Put the unzipped starter, generated dev data, and dev answer outside the repository.
+For a local build, install GCC 12+, make, and the LZ4 runtime (`liblz4-1` on Debian). Set the paths to the unzipped starter, generated data, and official answer.
 
 ```sh
-python3 -m pip install pyarrow==20.0.0 polars==1.32.3
-make native
+make -j2 portable
 make fixtures STARTER=../starter-duckdb
-python3 tests/boundaries.py build/shopping-sessions
-make run-dev DEV=../dev OUT=../out
+python3 tests/boundaries.py build/portable/shopping-sessions
+python3 tests/dense.py build/portable/shopping-sessions
+build/portable/shopping-sessions ../dev ../out
 make check-dev STARTER=../starter-duckdb OUT=../out ANSWER=../dev-answer
 ```
 
-The additional regression test covers records crossing megabyte boundaries, a 650-link chain, UTF-8 and NUL in IDs, mixed-length click-ID ties, and arbitrarily long decimal fields.
+## Measure elapsed time
 
-## How the pipeline works
+Generate a practice-sized dataset with the official generator. The benchmark launches a fresh process for each run, includes Parquet writes and process exit, and uses a fresh output directory each time. Repeated runs reuse the input files and the host filesystem cache. CPU model, CPU placement, and storage affect elapsed time.
 
-1. A disjoint-set forest joins every valid link. Each component tracks its byte-wise smallest ID, including IDs seen only in links.
-2. Workers read memory-mapped files in chunks and validate the LF-delimited CSV grammar. Each event ID goes to one deduplication partition. The earliest ingested candidate wins even when its event data is invalid.
-3. Surviving events and valid clicks are partitioned by canonical person. Workers sort events by time, deduplicate clicks, and use descending byte order for click IDs tied at a timestamp.
-4. Each session belongs to the UTC day of its first event. Two moving indices maintain the inclusive seven-day click window. The latest eligible click supplies the credit, and a count for each active campaign gives it one assist per session.
-5. The writer merges per-worker campaign totals and emits both tables with Apache Arrow and Parquet. Short ASCII identifiers use a lossless inline representation. All other identifiers are interned by their complete bytes and use the same byte-wise tie rules.
+```sh
+generate --seed 1837 --events 20000000 --clicks 5000000 --output ../bench20
+NCPU=8 taskset -c 0-7 python3 scripts/benchmark.py build/portable/shopping-sessions ../bench20 --runs 7
+```
 
-[Official rules, starter, generator, and dev answer](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions)
+## Pipeline
+
+1. A disjoint-set forest joins IDs across all link files. Each connected component keeps its byte-wise smallest name. Events can be decoded while the links are being joined.
+2. Workers read memory-mapped CSV chunks. Vectorized scans check row boundaries, delimiter counts, and quoting. The scalar parser handles irregular blocks, arbitrary UTF-8, literal NUL, and oversized records. Both paths validate timestamps against the manifest.
+3. A reversible 64-bit permutation partitions event IDs. Each partition compares complete keys and keeps the earliest ingestion time, including invalid winners. A replacement can retract a hit already assigned to another person.
+4. Workers group surviving events by person. For busy shoppers, time bins shorter than 30 minutes preserve the minimum and maximum event times. Comparing the last event in one occupied bin with the first event in the next gives the exact session boundary. Each session and all its purchases belong to the UTC date of its first event.
+5. A click covers a contiguous range of session starts. Campaign bitsets record distinct assists. The latest eligible click supplies credit, with byte-wise click ID ordering for ties. Identical click copies produce the same credit and set the same assist bits.
+6. Workers write completed user rows to Parquet as they aggregate. The flat writer emits standard data pages, nullable definition levels, UTF-8 and DATE annotations, and LZ4 raw compression. Campaign totals are combined across workers before their table is written. Wider time windows and large dimension tables use a full-width sort-based implementation.
+
+[Official rules, generator, starter, and dev answer](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions)

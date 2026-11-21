@@ -8,6 +8,10 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <immintrin.h>
+#include <future>
+#include <deque>
+#include <span>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -122,7 +126,7 @@ struct Input {
 // LF is the only record delimiter. Commas always delimit fields, even on
 // malformed lines. RFC CSV readers can silently accept or merge such lines.
 template<size_t N, class F>
-void rows(View chunk, F&& consume) {
+void scalar_rows(View chunk, F&& consume) {
     if (chunk.empty()) return;
     const char* p = chunk.data();
     const char* end = p + chunk.size();
@@ -148,6 +152,105 @@ void rows(View chunk, F&& consume) {
         }
         if (valid) consume(values);
     }
+}
+
+#if defined(__AVX2__) && defined(__BMI2__)
+template<size_t N> constexpr auto newline_pattern() {
+    std::array<uint64_t,N> table{};
+    for(unsigned start=0;start<N;++start)
+        for(unsigned i=0;i<64;++i)
+            if ((start+i)%N==N-1) table[start]|=uint64_t{1}<<i;
+    return table;
+}
+
+inline uint64_t low_bits(unsigned n) {
+    return _bzhi_u64(~uint64_t{0},n);
+}
+
+#endif
+
+#if defined(__AVX512BW__) && defined(__AVX512VBMI2__)
+// A descriptor stores the byte offset of a delimiter and one quote bit.
+// Validate entire blocks before consuming rows. A structurally irregular
+// block is replayed with the scalar grammar to isolate individual bad rows.
+template<size_t N, class F>
+bool indexed_rows(View input, F& consume, uint16_t* fields) {
+    static constexpr auto expected=newline_pattern<N>();
+    alignas(64) static constexpr auto seq=[]{
+        std::array<uint16_t,32> a{};
+        for(unsigned i=0;i<a.size();++i) a[i]=i;
+        return a;
+    }();
+    const char* p=input.data();
+    const size_t size=input.size();
+    unsigned count=0, previous_sep=1, previous_quote=0, open_field=p[0]=='"';
+    __m512i index=_mm512_load_si512(seq.data());
+    for(unsigned i=0;i<size;i+=64) {
+        const unsigned n=std::min<size_t>(64,size-i);
+        __m512i x = n==64 ? _mm512_loadu_si512(p+i) :
+            _mm512_maskz_loadu_epi8(low_bits(n),p+i);
+        uint64_t lf=_mm512_cmpeq_epi8_mask(x,_mm512_set1_epi8('\n'));
+        uint64_t sep=lf|_mm512_cmpeq_epi8_mask(x,_mm512_set1_epi8(','));
+        uint64_t q=_mm512_cmpeq_epi8_mask(x,_mm512_set1_epi8('"'));
+        unsigned ns=std::popcount(sep);
+        uint64_t valid=low_bits(ns);
+        if (_pext_u64(lf,sep)!=(expected[count%N]&valid)) return false;
+        char next=i+64<size ? p[i+64] : '\0';
+        uint64_t before=(sep<<1)|previous_sep;
+        uint64_t after=(sep>>1)|(uint64_t(next==','||next=='\n')<<63);
+        if(q & ~(before^after)) return false;
+        uint64_t quoted_end=(q<<1)|previous_quote;
+        uint64_t starts=_pext_u64((q>>1)|(uint64_t(next=='"')<<63),sep);
+        if ((_pext_u64(quoted_end,sep)^((starts<<1)|open_field))&valid) return false;
+        if(ns) open_field=(starts>>(ns-1))&1;
+        const __m512i flag=_mm512_set1_epi16(short(0x8000));
+        __m512i lower=_mm512_mask_add_epi16(index,uint32_t(quoted_end),index,flag);
+        _mm512_mask_compressstoreu_epi16(fields+count,uint32_t(sep),lower);
+        __m512i high=_mm512_add_epi16(index,_mm512_set1_epi16(32));
+        high=_mm512_mask_add_epi16(high,uint32_t(quoted_end>>32),high,flag);
+        _mm512_mask_compressstoreu_epi16(fields+count+std::popcount(uint32_t(sep)),uint32_t(sep>>32),high);
+        index=_mm512_add_epi16(index,_mm512_set1_epi16(64));
+        count+=ns;
+        previous_sep=sep>>63; previous_quote=q>>63;
+    }
+    if(count%N) return false;
+    unsigned begin=0;
+    for(unsigned row=0;row<count;row+=N) {
+        std::array<View,N> out;
+        for(unsigned k=0;k<N;++k) {
+            unsigned d=fields[row+k], quoted=d>>15, end=d&32767;
+            out[k]=View(p+begin+quoted,end-begin-2*quoted);
+            begin=end+1;
+        }
+        consume(out);
+    }
+    return true;
+}
+template<size_t N, class F>
+void vector_rows(View chunk,F&& consume) {
+    alignas(64) uint16_t fields[4352];
+    while(!chunk.empty()) {
+        size_t size=chunk.size();
+        if(size>4096) {
+            auto lf=chunk.find('\n',4095);
+            size=lf==View::npos ? size : lf+1;
+        }
+        View part=chunk.substr(0,size);
+        if(size>4352 || part.back()!='\n' || !indexed_rows<N>(part,consume,fields))
+            scalar_rows<N>(part,consume);
+        chunk.remove_prefix(size);
+    }
+}
+#endif
+
+template<size_t N, class F>
+void rows(View chunk, F&& consume) {
+    if (chunk.empty()) return;
+#if defined(__AVX512BW__) && defined(__AVX512VBMI2__)
+    vector_rows<N>(chunk,consume);
+#else
+    scalar_rows<N>(chunk,consume);
+#endif
 }
 
 template<class F>
@@ -179,13 +282,14 @@ void jobs(size_t count, unsigned threads, F&& work) {
 
 // Short nonzero ASCII strings fit losslessly in nine 7-bit slots. Unsigned
 // comparison gives their byte order. Every other ID is interned by exact bytes.
-// All source mappings outlive the dictionary and its readers.
+// Interned strings own their storage independently of the source mappings.
 class Keys {
     static constexpr Key external = Key{1} << 63;
     struct Bucket {
-        std::mutex mutex;
+        mutable std::mutex mutex;
         std::unordered_map<View, Key> intern;
         std::vector<View> reverse;
+        std::deque<std::string> owned;
     };
     std::array<Bucket, 64> buckets_;
 
@@ -193,12 +297,41 @@ class Keys {
         size_t bucket = std::hash<View>{}(s) % buckets_.size();
         auto& b = buckets_[bucket];
         std::lock_guard lock(b.mutex);
-        auto [it, is_new] = b.intern.try_emplace(s, external | (Key(b.reverse.size()) << 6) | bucket);
-        if (is_new) b.reverse.push_back(s);
-        return it->second;
+        auto found=b.intern.find(s);
+        if(found!=b.intern.end()) return found->second;
+        Key id=external | (Key(b.reverse.size()) << 6) | bucket;
+        b.owned.emplace_back(s);
+        View stable=b.owned.back();
+        b.reverse.push_back(stable);
+        b.intern.emplace(stable,id);
+        return id;
     }
 public:
+    Key clean(const char* p,size_t n) {
+#if defined(__BMI2__)
+        if(n<=9) {
+            uint64_t w;
+            std::memcpy(&w,p,8);
+            Key k=(_pext_u64(__builtin_bswap64(w),0x7f7f7f7f7f7f7f7fULL)<<7)|
+                (static_cast<unsigned char>(p[8])&127u);
+            return k & (~Key{0}<<(7*(9-n)));
+        }
+#endif
+        return encode(View(p,n));
+    }
     Key encode(View s) {
+#if defined(__BMI2__)
+        if (s.size() == 9 || s.size() == 8) {
+            uint64_t word;
+            std::memcpy(&word, s.data(), 8);
+            constexpr uint64_t high = 0x8080808080808080ULL;
+            unsigned char ninth = s.size() == 9 ? s[8] : 1;
+            if (!((((word - 0x0101010101010101ULL) & ~word) | word) & high) &&
+                ninth && ninth < 128)
+                return (_pext_u64(__builtin_bswap64(word), ~high) << 7) |
+                       (s.size() == 9 ? ninth : 0);
+        }
+#endif
         if (s.size() <= 9) {
             Key k = 0;
             for (unsigned char c : s) {
@@ -211,7 +344,17 @@ public:
     }
     // Called between input phases, or after parsing has finished.
     View decode(Key k, char (&buf)[9]) const {
-        if (k & external) return buckets_[k & 63].reverse[(k ^ external) >> 6];
+        if (k & external) {
+            const auto& bucket = buckets_[k & 63];
+            std::lock_guard lock(bucket.mutex);
+            return bucket.reverse[(k ^ external) >> 6];
+        }
+#if defined(__BMI2__)
+        uint64_t bytes = __builtin_bswap64(_pdep_u64(k >> 7, 0x7f7f7f7f7f7f7f7fULL));
+        std::memcpy(buf, &bytes, 8);
+        buf[8] = k & 127;
+        return View(buf, k ? 9 - std::countr_zero(k) / 7 : 0);
+#endif
         size_t n = 0;
         for (int shift = 56; shift >= 0; shift -= 7) {
             char c = static_cast<char>((k >> shift) & 127);

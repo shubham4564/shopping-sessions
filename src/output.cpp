@@ -1,114 +1,111 @@
 #include "output.hpp"
-#include <arrow/api.h>
-#include <arrow/io/file.h>
-#include <parquet/arrow/writer.h>
-#include <parquet/properties.h>
+#include "parquet.hpp"
 
 namespace shop {
 namespace {
-void check(const arrow::Status& s) {
-    if (!s.ok()) throw std::runtime_error(s.ToString());
-}
-template<class T> T take(arrow::Result<T> r) {
-    check(r.status());
-    return std::move(r).ValueUnsafe();
-}
-template<class T> std::shared_ptr<arrow::Array> finish(T& builder) { return take(builder.Finish()); }
-using Schema = std::shared_ptr<arrow::Schema>;
-const auto text_type = arrow::utf8();
-const auto date_type = arrow::date32();
-const auto integer = arrow::int64();
-
-class Writer {
-    std::shared_ptr<arrow::io::FileOutputStream> file_;
-    std::unique_ptr<parquet::arrow::FileWriter> writer_;
-public:
-    Schema schema;
-    Writer(const fs::path& path, Schema s) : schema(std::move(s)) {
-        file_ = take(arrow::io::FileOutputStream::Open(path.string()));
-        parquet::WriterProperties::Builder properties;
-        properties.compression(parquet::Compression::SNAPPY);
-        writer_ = take(parquet::arrow::FileWriter::Open(*schema, arrow::default_memory_pool(),
-                                                       file_, properties.build()));
-    }
-    void batch(const std::vector<std::shared_ptr<arrow::Array>>& columns) {
-        auto table = arrow::Table::Make(schema, columns);
-        check(writer_->WriteTable(*table, table->num_rows()));
-    }
-    void close() { check(writer_->Close()); check(file_->Close()); }
-};
-
-void user_file(const fs::path& path, const Keys& keys, const Dimensions& dim,
-               const std::vector<std::vector<UserDay>>& groups) {
-    Writer out(path, arrow::schema({arrow::field("user_id", text_type, false),
-        arrow::field("day", date_type, false), arrow::field("sessions",integer,false),
-        arrow::field("events",integer,false), arrow::field("revenue_cents",integer,false),
-        arrow::field("top_category",text_type)}));
-    arrow::StringBuilder users, categories;
-    arrow::Date32Builder days;
-    arrow::Int64Builder sessions, events, revenue;
-    auto flush = [&] {
-        if (days.length()) out.batch({finish(users), finish(days), finish(sessions),
-                                     finish(events), finish(revenue), finish(categories)});
-    };
-    for (const auto& group : groups) for (const auto& row : group) {
-        char buf[9];
-        check(users.Append(keys.decode(row.person, buf)));
-        check(days.Append(row.day));
-        check(sessions.Append(row.sessions));
-        check(events.Append(row.events));
-        check(revenue.Append(row.revenue));
-        if (row.category == no_category) check(categories.AppendNull());
-        else check(categories.Append(dim.categories[row.category]));
-        if (days.length() == 65536) flush();
-    }
-    flush();
-    out.close();
-}
+using namespace parquet;
+constexpr std::array<Field, 6> user_schema{{{"user_id", bytes, utf8},
+                                            {"day", i32, date},
+                                            {"sessions", i64},
+                                            {"events", i64},
+                                            {"revenue_cents", i64},
+                                            {"top_category", bytes, utf8, true}}};
+constexpr std::array<Field, 7> campaign_schema{{{"campaign_id", bytes, utf8},
+                                                {"channel", bytes, utf8},
+                                                {"day", i32, date},
+                                                {"sessions", i64},
+                                                {"purchasing_sessions", i64},
+                                                {"revenue_cents", i64},
+                                                {"assisted_sessions", i64}}};
 
 void campaign_file(const fs::path& path, const Dimensions& dim, const CampaignDays& rows) {
-    Writer out(path, arrow::schema({arrow::field("campaign_id",text_type,false),
-        arrow::field("channel",text_type,false), arrow::field("day",date_type,false),
-        arrow::field("sessions",integer,false), arrow::field("purchasing_sessions",integer,false),
-        arrow::field("revenue_cents",integer,false), arrow::field("assisted_sessions",integer,false)}));
-    arrow::StringBuilder campaigns, channels;
-    arrow::Date32Builder days;
-    arrow::Int64Builder sessions, purchases, revenue, assists;
-    auto flush = [&] {
-        if (days.length()) out.batch({finish(campaigns), finish(channels), finish(days), finish(sessions),
-                                     finish(purchases), finish(revenue), finish(assists)});
-    };
-    for (const auto& [key, count] : rows) {
-        const auto& ad = dim.campaigns[static_cast<uint32_t>(key)];
-        check(campaigns.Append(ad.id));
-        check(channels.Append(ad.channel));
-        check(days.Append(static_cast<int32_t>(key >> 32)));
-        check(sessions.Append(count.sessions));
-        check(purchases.Append(count.purchasers));
-        check(revenue.Append(count.revenue));
-        check(assists.Append(count.assists));
-        if (days.length() == 65536) flush();
+    File file(path, campaign_schema);
+    auto& v = file.values;
+    for (const auto& [key, c] : rows) {
+        const auto& campaign = dim.campaigns[uint32_t(key)];
+        v[0].string(campaign.id);
+        v[1].string(campaign.channel);
+        v[2].number(int32_t(key >> 32));
+        v[3].number(c.sessions);
+        v[4].number(c.purchasers);
+        v[5].number(c.revenue);
+        v[6].number(c.assists);
+        file.finish_row();
     }
-    flush();
-    out.close();
+    file.close();
 }
+} // namespace
+struct Output::State {
+    const Keys& keys;
+    const Dimensions& dim;
+    std::array<fs::path, parts + 1> temp, dest;
+    std::array<std::unique_ptr<parquet::File>, parts> users;
+    bool committed = false;
+    State(const fs::path& out, const Keys& k, const Dimensions& d) : keys(k), dim(d) {
+        auto u = out / "user_daily", c = out / "campaign_daily";
+        fs::create_directories(u);
+        fs::create_directories(c);
+        std::string prefix = ".write-" + std::to_string(getpid()) + "-";
+        for (unsigned i = 0; i <= parts; ++i) {
+            const auto& folder = i == parts ? c : u;
+            temp[i] = folder / (prefix + std::to_string(i));
+            dest[i] = folder / ("part-" + std::to_string(i == parts ? 0 : i) + ".parquet");
+        }
+    }
+    ~State() {
+        if (!committed) {
+            std::error_code ec;
+            for (auto& p : temp)
+                fs::remove(p, ec);
+        }
+    }
+};
+Output::Output(const fs::path& out, const Keys& keys, const Dimensions& dim)
+    : state_(std::make_unique<State>(out, keys, dim)) {
+}
+Output::~Output() = default;
+
+void Output::append(unsigned part, std::span<const UserDay> rows) {
+    auto& file = state_->users[part];
+    if (!file)
+        file = std::make_unique<parquet::File>(state_->temp[part], user_schema);
+    auto& v = file->values;
+    char name[9];
+    for (const auto& row : rows) {
+        v[0].string(state_->keys.decode(row.person, name));
+        v[1].number(row.day);
+        v[2].number(row.sessions);
+        v[3].number(row.events);
+        v[4].number(row.revenue);
+        if (row.category != no_category) {
+            file->defined();
+            v[5].string(state_->dim.categories[row.category]);
+        }
+        file->finish_row();
+    }
+}
+void Output::finish(const CampaignDays& totals, unsigned workers) {
+    jobs(parts + 1, workers, [&](unsigned, size_t i) {
+        if (i == parts)
+            campaign_file(state_->temp[i], state_->dim, totals);
+        else {
+            if (!state_->users[i])
+                append(i, {});
+            state_->users[i]->close();
+        }
+    });
+    for (unsigned i = 0; i <= parts; ++i)
+        fs::rename(state_->temp[i], state_->dest[i]);
+    state_->committed = true;
 }
 void write_output(const fs::path& out, const Keys& keys, const Dimensions& dim,
-                  const std::vector<std::vector<UserDay>>& users, const CampaignDays& campaigns) {
-    const fs::path u = out / "user_daily", c = out / "campaign_daily";
-    fs::create_directories(u);
-    fs::create_directories(c);
-    std::string tmp = ".part-" + std::to_string(getpid()) + ".tmp";
-    try {
-        user_file(u / tmp, keys, dim, users);
-        campaign_file(c / tmp, dim, campaigns);
-        fs::rename(u / tmp, u / "part-0.parquet");
-        fs::rename(c / tmp, c / "part-0.parquet");
-    } catch (...) {
-        std::error_code ec;
-        fs::remove(u / tmp, ec);
-        fs::remove(c / tmp, ec);
-        throw;
-    }
+                  const std::vector<std::vector<UserDay>>& people, const CampaignDays& totals,
+                  unsigned workers) {
+    Output writer(out, keys, dim);
+    jobs(Output::parts, workers, [&](unsigned, size_t i) {
+        for (size_t j = people.size() * i / Output::parts; j < people.size() * (i + 1) / Output::parts; ++j)
+            writer.append(i, people[j]);
+    });
+    writer.finish(totals, workers);
 }
-}
+} // namespace shop

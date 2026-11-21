@@ -1,7 +1,6 @@
 CXX ?= g++
 CXXFLAGS ?= -O3 -DNDEBUG
 PYTHON ?= python3
-ARROW_DIR ?= $(shell $(PYTHON) -c 'import importlib.util as u; from pathlib import Path; print(Path(u.find_spec("pyarrow").origin).parent)')
 IMAGE ?= shopping-sessions:latest
 PLATFORM ?= linux/amd64
 STARTER ?= ../starter-duckdb
@@ -10,13 +9,31 @@ DEV ?= dev
 ANSWER ?= dev-answer
 OUT ?= out
 
-.PHONY: native build fixtures dev run-dev check-dev
-native: build/shopping-sessions
+.PHONY: native portable build fixtures dev run-dev check-dev
+HEADERS := $(wildcard src/*.hpp)
+SOURCES := src/main.cpp src/output.cpp
+COMPILE = $(CXX) $(CXXFLAGS) -std=c++20 -pthread -Wall -Wextra
+LINK = -Wl,-rpath,'$$ORIGIN/lib' -l:liblz4.so.1
 
-build/shopping-sessions: src/main.cpp src/output.cpp src/output.hpp src/input.hpp src/model.hpp
+native: build/shopping-sessions
+build/shopping-sessions: $(SOURCES) $(HEADERS)
 	mkdir -p build
-	$(CXX) $(CXXFLAGS) -std=c++20 -pthread -Wall -Wextra -isystem "$(ARROW_DIR)/include" src/main.cpp src/output.cpp -L"$(ARROW_DIR)" -Wl,-rpath,'$$ORIGIN/lib' -l:libparquet.so.2000 -l:libarrow.so.2000 -o $@
-	ln -sfn "$(abspath $(ARROW_DIR))" build/lib
+	$(COMPILE) -march=native $(SOURCES) $(LINK) -o $@
+
+ARCH-base = -march=x86-64
+ARCH-avx2 = -march=x86-64-v3
+ARCH-avx512 = -march=x86-64-v4
+ARCH-vbmi2 = -march=x86-64-v4 -mavx512vbmi2
+VARIANTS = base avx2 avx512 vbmi2
+portable: build/portable/shopping-sessions $(addprefix build/portable/engine-,$(VARIANTS))
+
+build/portable/engine-%: $(SOURCES) $(HEADERS)
+	mkdir -p build/portable
+	$(COMPILE) $(ARCH-$*) $(SOURCES) $(LINK) -o $@
+
+build/portable/shopping-sessions: src/launcher.cpp
+	mkdir -p build/portable
+	$(CXX) -O2 -std=c++20 -march=x86-64 -Wall -Wextra $< -o $@
 
 build:
 	docker buildx build --platform $(PLATFORM) --load -t $(IMAGE) .

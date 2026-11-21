@@ -1,4 +1,5 @@
 #include "output.hpp"
+#include "compact.hpp"
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
@@ -11,10 +12,10 @@ template<class T> using Bins = std::array<std::vector<T>, partitions>;
 template<class T> void release(std::vector<T>& v) { std::vector<T>().swap(v); }
 size_t shard(Key k) { return mix(k) & (partitions - 1); }
 
-Event validate(const std::array<View,7>& f, int64_t ingest, Window w, Keys& keys,
+Event validate(const std::array<View,7>& f, int64_t ingest, Window w, const Dates& dt, Keys& keys,
                const Dimensions& dim) {
     if (f[1].empty() || f[5].empty()) return {};
-    int64_t ts = timestamp(f[2]);
+    int64_t ts = dt.parse(f[2]);
     if (ts < w.start || ts >= w.end || ingest > ts + day_ms) return {};
     uint32_t cents = 0, category = 0;
     if (f[4] == "purchase") {
@@ -28,17 +29,17 @@ Event validate(const std::array<View,7>& f, int64_t ingest, Window w, Keys& keys
     return {keys.encode(f[1]), ts, cents, category};
 }
 
-void read_events(const Input& input, Window w, Keys& keys, const Dimensions& dim,
+void read_events(const Input& input, Window w, const Dates& dt, Keys& keys, const Dimensions& dim,
                  std::vector<Bins<Candidate>>& bins) {
     jobs(input.chunks.size(), bins.size(), [&](unsigned lane, size_t i) {
         rows<7>(input.chunks[i], [&](const auto& f) {
             if (f[0].empty()) return;
             Key id = keys.encode(f[0]);
-            int64_t ingest = timestamp(f[3]);
+            int64_t ingest = dt.parse(f[3]);
             if (ingest == bad_time) return; // ingest_ts is guaranteed valid F1.
             // Invalid candidates still compete. A winning tombstone suppresses
             // all later, valid copies, including copies naming another user.
-            bins[lane][shard(id)].push_back({id, ingest, validate(f, ingest, w, keys, dim)});
+            bins[lane][shard(id)].push_back({id, ingest, validate(f, ingest, w, dt, keys, dim)});
         });
     });
 }
@@ -65,14 +66,14 @@ void deduplicate(std::vector<Bins<Candidate>>& candidates, const People& people,
     });
 }
 
-void read_clicks(const Input& input, Window w, Keys& keys, const People& people,
+void read_clicks(const Input& input, Window w, const Dates& dt, Keys& keys, const People& people,
                  const Dimensions& dim, std::vector<Bins<Click>>& bins) {
     jobs(input.chunks.size(), bins.size(), [&](unsigned lane, size_t i) {
         rows<4>(input.chunks[i], [&](const auto& f) {
             if (f[0].empty() || f[1].empty()) return;
             auto ad = dim.campaign.find(f[2]);
             if (ad == dim.campaign.end()) return;
-            int64_t ts = timestamp(f[3]);
+            int64_t ts = dt.parse(f[3]);
             if (ts < w.start - week_ms || ts >= w.end) return;
             Key person = people.canonical(keys.encode(f[1]));
             bins[lane][shard(person)].push_back({person, ts, keys.encode(f[0]), ad->second});
@@ -230,18 +231,24 @@ void run(const fs::path& in, const fs::path& out, unsigned cpu) {
     Input products(in/"products.csv"), ads(in/"campaigns.csv"), links(in/"links");
     Input events(in/"events"), clicks(in/"clicks");
     Keys keys;
+    Dates dt(window);
     Dimensions dim(products, ads);
-    People people(links, keys);
-    mark("linked IDs");
+    if (compact::suitable(window,dim)) {
+        compact::run(events,clicks,links,out,window,dt,keys,dim,cpu,mark);
+        return;
+    }
+    auto linking = std::async(std::launch::async, [&] { return People(links, keys); });
+    mark("opened inputs");
     unsigned lanes = std::min<unsigned>(cpu, std::max<size_t>(1, events.chunks.size() + clicks.chunks.size()));
     std::vector<Bins<Candidate>> candidates(lanes);
     std::vector<Bins<Event>> event_bins(lanes);
     std::vector<Bins<Click>> click_bins(lanes);
-    read_events(events, window, keys, dim, candidates);
-    mark("parsed events");
+    read_events(events, window, dt, keys, dim, candidates);
+    People people = linking.get();
+    mark("linked IDs and parsed events");
     deduplicate(candidates, people, event_bins);
     mark("deduplicated events");
-    read_clicks(clicks, window, keys, people, dim, click_bins);
+    read_clicks(clicks, window, dt, keys, people, dim, click_bins);
     mark("parsed clicks");
     std::vector<Aggregate> workers;
     for (unsigned i=0; i<lanes; ++i) workers.emplace_back(dim);
@@ -255,7 +262,7 @@ void run(const fs::path& in, const fs::path& out, unsigned cpu) {
     for (const auto& worker : workers)
         for (const auto& [key, count] : worker.campaigns) totals[key] += count;
     mark("aggregated sessions");
-    write_output(out, keys, dim, users, totals);
+    write_output(out, keys, dim, users, totals, cpu);
     mark("wrote parquet");
 }
 }
