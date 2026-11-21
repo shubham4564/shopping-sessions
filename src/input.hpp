@@ -307,6 +307,18 @@ class Keys {
         return id;
     }
 public:
+    Key clean_unordered(const char* p, size_t n) {
+#if defined(__BMI2__)
+        if (n <= 9) {
+            uint64_t w;
+            std::memcpy(&w, p, 8);
+            if (n == 9)
+                return _pext_u64(w, 0x7f7f7f7f7f7f7f7fULL) | (uint64_t(static_cast<unsigned char>(p[8])) << 56);
+            return _pext_u64(_bzhi_u64(w, unsigned(n * 8)), 0x7f7f7f7f7f7f7f7fULL);
+        }
+#endif
+        return encode(View(p, n));
+    }
     Key clean(const char* p,size_t n) {
 #if defined(__BMI2__)
         if(n<=9) {

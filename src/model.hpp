@@ -6,6 +6,119 @@ class People {
     struct Slot {
         Key id, value;
     };
+    struct UnmapDirect {
+        size_t bytes;
+        void operator()(uint32_t* p) const { if (p) munmap(p, bytes); }
+    };
+    using DirectStorage = std::unique_ptr<uint32_t[], UnmapDirect>;
+    DirectStorage direct_storage_{nullptr, UnmapDirect{0}};
+    uint32_t* direct_ = nullptr;
+    std::vector<uint64_t> remapped_;
+    uint32_t direct_cap_ = 0;
+    uint8_t direct_mode_ = 0; // 0=none, 1=fixed 'u'+7d, 2=fixed 'u'+Wd, 3=var 'u'+d
+    uint8_t direct_width_ = 0;
+
+    static constexpr uint32_t parse_fixed7_key(Key k) {
+        if ((k & 0x7fu) != 0 || (k >> 56) != 'u')
+            return UINT32_MAX;
+#if defined(__BMI2__)
+        uint64_t w = __builtin_bswap64(_pdep_u64(k >> 7, 0x7f7f7f7f7f7f7f7fULL));
+        uint64_t d = (w & ~0xFFULL) | uint64_t('0');
+        if (((d & 0xF0F0F0F0F0F0F0F0ULL) != 0x3030303030303030ULL) |
+            (((d + 0x0606060606060606ULL) & 0xF0F0F0F0F0F0F0F0ULL) != 0x3030303030303030ULL))
+            return UINT32_MAX;
+        uint64_t val = d & 0x0F0F0F0F0F0F0F0FULL;
+        val = (val * 10 + (val >> 8)) & 0x00FF00FF00FF00FFULL;
+        val = (val * 100 + (val >> 16)) & 0x0000FFFF0000FFFFULL;
+        val = (val * 10000 + (val >> 32)) & 0x00000000FFFFFFFFULL;
+        return uint32_t(val);
+#else
+        uint32_t val = 0;
+        for (int shift = 49; shift >= 7; shift -= 7) {
+            unsigned d = unsigned((k >> shift) & 127u) - '0';
+            if (d > 9) return UINT32_MAX;
+            val = val * 10 + d;
+        }
+        return val;
+#endif
+    }
+    static constexpr uint32_t parse_fixedw_key(Key k, unsigned w) {
+        if ((k >> 56) != 'u')
+            return UINT32_MAX;
+        if (w < 8 && (k & ((Key{1} << (7 * (8 - w))) - 1)) != 0)
+            return UINT32_MAX;
+        uint32_t val = 0;
+        for (unsigned i = 0; i < w; ++i) {
+            unsigned d = unsigned((k >> (49 - 7 * i)) & 127u) - '0';
+            if (d > 9) return UINT32_MAX;
+            val = val * 10 + d;
+        }
+        return val;
+    }
+    static constexpr uint32_t parse_var_key(Key k) {
+        if ((k >> 56) != 'u')
+            return UINT32_MAX;
+        unsigned first = unsigned((k >> 49) & 127u) - '0';
+        if (first > 9) return UINT32_MAX;
+        if (first == 0) {
+            return (k & ((Key{1} << 49) - 1)) == 0 ? 0u : UINT32_MAX;
+        }
+        uint32_t val = first;
+        for (int shift = 42; shift >= 0; shift -= 7) {
+            unsigned ch = unsigned((k >> shift) & 127u);
+            if (!ch) return val;
+            unsigned d = ch - '0';
+            if (d > 9) return UINT32_MAX;
+            val = val * 10 + d;
+        }
+        return val;
+    }
+    [[gnu::always_inline]] inline uint32_t parse_direct(Key k) const {
+        if (direct_mode_ == 1) [[likely]]
+            return parse_fixed7_key(k);
+        if (direct_mode_ == 2)
+            return parse_fixedw_key(k, direct_width_);
+        return parse_var_key(k);
+    }
+    Key format_direct(uint32_t n) const {
+        char buf[9];
+        buf[0] = 'u';
+        size_t len = 1;
+        if (direct_mode_ == 1 || direct_mode_ == 2) {
+            unsigned w = direct_mode_ == 1 ? 7u : direct_width_;
+            for (unsigned i = w; i-- > 0;) {
+                buf[1 + i] = char('0' + (n % 10));
+                n /= 10;
+            }
+            len = 1 + w;
+        } else {
+            char tmp[10];
+            unsigned t = 0;
+            do {
+                tmp[t++] = char('0' + (n % 10));
+                n /= 10;
+            } while (n);
+            while (t--)
+                buf[len++] = tmp[t];
+        }
+        Key k = 0;
+        for (size_t i = 0; i < len; ++i)
+            k = (k << 7) | static_cast<unsigned char>(buf[i]);
+        return k << (7 * (9 - len));
+    }
+    void init_direct_storage(uint32_t cap) {
+        if (!cap) return;
+        cap = (cap + 255u) & ~255u;
+        size_t bytes = size_t(cap) * sizeof(uint32_t);
+        void* mem = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mem == MAP_FAILED)
+            return;
+        madvise(mem, bytes, MADV_HUGEPAGE);
+        direct_storage_ = DirectStorage(::new (mem) uint32_t[cap], UnmapDirect{bytes});
+        direct_ = direct_storage_.get();
+        remapped_.assign((cap + 63u) >> 6, 0);
+        direct_cap_ = cap;
+    }
     struct Component {
         uint32_t parent, count;
         Key name;
@@ -194,16 +307,83 @@ class People {
             for (auto& v : vertices[i])
                 v.root = find_root(v.slot);
         });
+        // Auto-detect numeric 'u' user ID pattern from linked vertices.
+        size_t sampled = 0, fixed_hits[9]{}, var_hits = 0;
+        for (size_t i = 0; i < vertices.size() && sampled < 1024; ++i) {
+            for (auto v : vertices[i]) {
+                if (sampled >= 1024) break;
+                Key k = table_[v.slot].id;
+                ++sampled;
+                if ((k >> 56) != 'u' || (k & (Key{1} << 63))) continue;
+                unsigned len = k ? 9 - std::countr_zero(k) / 7 : 0;
+                if (len >= 6 && len <= 9 && parse_fixedw_key(k, len - 1) != UINT32_MAX)
+                    ++fixed_hits[len - 1];
+                if (parse_var_key(k) != UINT32_MAX)
+                    ++var_hits;
+            }
+        }
+        unsigned best_w = 0;
+        size_t best_fixed = 0;
+        for (unsigned w = 5; w <= 8; ++w) {
+            if (fixed_hits[w] > best_fixed) {
+                best_fixed = fixed_hits[w];
+                best_w = w;
+            }
+        }
+        if (sampled >= 32) {
+            if (best_fixed * 2 >= sampled) {
+                direct_mode_ = (best_w == 7) ? 1 : 2;
+                direct_width_ = uint8_t(best_w);
+            } else if (var_hits * 2 >= sampled) {
+                direct_mode_ = 3;
+            }
+        }
+        if (direct_mode_) {
+            uint32_t max_id = 0;
+            for (size_t i = 0; i < vertices.size(); ++i) {
+                for (auto v : vertices[i]) {
+                    uint32_t id = parse_direct(table_[v.slot].id);
+                    if (id < (16u << 20) && id > max_id)
+                        max_id = id;
+                }
+            }
+            uint32_t cap = std::clamp<uint32_t>(max_id + max_id / 4 + 65536u, 65536u, 16u << 20);
+            init_direct_storage(cap);
+        }
         names_.reset(new Key[table_.size()]);
         jobs(vertices.size(), threads, [&](unsigned, size_t i) {
-            for (auto v : vertices[i])
-                if (v.root == v.slot)
-                    table_[v.slot].value = uint64_t(record_name(v.slot, table_[v.slot].id)) + 1;
+            for (auto v : vertices[i]) {
+                if (v.root == v.slot) {
+                    Key k = table_[v.slot].id;
+                    uint32_t code;
+                    uint32_t did = direct_cap_ ? parse_direct(k) : UINT32_MAX;
+                    if (did < direct_cap_) {
+                        code = did;
+                        direct_[did] = code + 1;
+                    } else {
+                        code = direct_cap_ + record_name(v.slot, k);
+                    }
+                    table_[v.slot].value = uint64_t(code) + 1;
+                }
+            }
         });
         jobs(vertices.size(), threads, [&](unsigned, size_t i) {
-            for (auto v : vertices[i])
-                if (v.root != v.slot)
-                    table_[v.slot].value = table_[v.root].value;
+            for (auto v : vertices[i]) {
+                if (v.root != v.slot) {
+                    uint64_t val = table_[v.root].value;
+                    table_[v.slot].value = val;
+                    if (direct_cap_) {
+                        uint32_t did = parse_direct(table_[v.slot].id);
+                        if (did < direct_cap_) {
+                            direct_[did] = uint32_t(val);
+                            if (uint32_t(val) - 1u != did) {
+                                std::atomic_ref<uint64_t>(remapped_[did >> 6])
+                                    .fetch_or(uint64_t{1} << (did & 63), std::memory_order_relaxed);
+                            }
+                        }
+                    }
+                }
+            }
         });
         probe_limit_ = 48;
         return true;
@@ -267,21 +447,112 @@ class People {
         }
         std::vector<Component>().swap(nodes_);
     }
-    void prefetch(Key id) const { __builtin_prefetch(&table_[hash_user(id) & mask_], 0, 1); }
+    void prefetch(Key id) const {
+        if (direct_cap_) {
+            uint32_t did = parse_direct(id);
+            if (did < direct_cap_) [[likely]] {
+                __builtin_prefetch(&remapped_[did >> 6], 0, 1);
+                return;
+            }
+        }
+        __builtin_prefetch(&table_[hash_user(id) & mask_], 0, 1);
+    }
     Key canonical(Key id) const {
+        if (direct_cap_) {
+            uint32_t did = parse_direct(id);
+            if (did < direct_cap_) {
+                uint32_t v = direct_[did];
+                return v ? name(v - 1) : id;
+            }
+        }
         const auto& slot = table_[locate(id)];
         return slot.id ? name(slot.value - 1) : id;
     }
     // Linked components already have a representative slot. Install isolated
     // IDs concurrently into empty slots; full-byte keys resolve every collision.
-    uint32_t number(Key k) {
+    static inline uint32_t parse_fixed7_raw(const char* p) {
+        if (p[0] != 'u')
+            return UINT32_MAX;
+        uint64_t w;
+        std::memcpy(&w, p, 8);
+        uint64_t d = (w & ~0xFFULL) | uint64_t('0');
+        if (((d & 0xF0F0F0F0F0F0F0F0ULL) != 0x3030303030303030ULL) |
+            (((d + 0x0606060606060606ULL) & 0xF0F0F0F0F0F0F0F0ULL) != 0x3030303030303030ULL))
+            return UINT32_MAX;
+        uint64_t val = d & 0x0F0F0F0F0F0F0F0FULL;
+        val = (val * 10 + (val >> 8)) & 0x00FF00FF00FF00FFULL;
+        val = (val * 100 + (val >> 16)) & 0x0000FFFF0000FFFFULL;
+        val = (val * 10000 + (val >> 32)) & 0x00000000FFFFFFFFULL;
+        return uint32_t(val);
+    }
+    [[gnu::always_inline]] inline uint32_t try_parse_direct_raw(const char* p, size_t n) const {
+        if (direct_mode_ == 1 && n == 8) [[likely]] {
+            uint32_t did = parse_fixed7_raw(p);
+            if (did < direct_cap_) [[likely]] return did;
+        }
+        return UINT32_MAX;
+    }
+    [[gnu::always_inline]] inline void prefetch_did(uint32_t did) const {
+        if (did != UINT32_MAX) [[likely]]
+            __builtin_prefetch(&remapped_[did >> 6], 0, 1);
+    }
+    [[gnu::always_inline]] inline uint32_t resolve_did_or_clean(uint32_t did, const char* p, size_t n, Keys& keys) {
+        if (did != UINT32_MAX) [[likely]] {
+            if (!((remapped_[did >> 6] >> (did & 63)) & 1ULL)) [[likely]]
+                return did;
+            return direct_[did] - 1;
+        }
+        return number(keys.clean(p, n));
+    }
+    [[gnu::always_inline]] inline void prefetch_raw_clean(const char* p, size_t n) const {
+        if (direct_mode_ == 1 && n == 8) [[likely]] {
+            uint32_t did = parse_fixed7_raw(p);
+            if (did < direct_cap_) [[likely]] {
+                __builtin_prefetch(&remapped_[did >> 6], 0, 1);
+            }
+        }
+    }
+    [[gnu::always_inline]] inline uint32_t number_raw_clean(const char* p, size_t n, Keys& keys) {
+        if (direct_mode_ == 1 && n == 8) [[likely]] {
+            uint32_t did = parse_fixed7_raw(p);
+            if (did < direct_cap_) [[likely]] {
+                if (!((remapped_[did >> 6] >> (did & 63)) & 1ULL)) [[likely]]
+                    return did;
+                return direct_[did] - 1;
+            }
+        }
+        return number(keys.clean(p, n));
+    }
+    [[gnu::always_inline]] inline uint32_t number_raw(View s, Keys& keys) {
+        if (direct_mode_ == 1 && s.size() == 8) [[likely]] {
+            uint32_t did = parse_fixed7_raw(s.data());
+            if (did < direct_cap_) [[likely]] {
+                if (!((remapped_[did >> 6] >> (did & 63)) & 1ULL)) [[likely]]
+                    return did;
+                return direct_[did] - 1;
+            }
+        }
+        return number(keys.encode(s));
+    }
+    [[gnu::always_inline]] inline uint32_t number(Key k) {
+        if (direct_cap_) {
+            uint32_t did = parse_direct(k);
+            if (did < direct_cap_) [[likely]] {
+                if (!((remapped_[did >> 6] >> (did & 63)) & 1ULL)) [[likely]]
+                    return did;
+                return direct_[did] - 1;
+            }
+        }
+        return number_slow(k);
+    }
+    [[gnu::noinline]] uint32_t number_slow(Key k) {
         size_t hash = hash_user(k), at = hash & mask_;
         for (size_t probe = 0; probe < probe_limit_; ++probe) {
             auto& slot = table_[at];
             std::atomic_ref<Key> id(slot.id);
             Key seen = id.load(std::memory_order_relaxed);
             if (!seen && id.compare_exchange_strong(seen, k, std::memory_order_relaxed)) {
-                uint32_t code = record_name(at, k);
+                uint32_t code = direct_cap_ + record_name(at, k);
                 std::atomic_ref<Key>(slot.value).store(uint64_t(code) + 1, std::memory_order_release);
                 return code;
             }
@@ -299,23 +570,27 @@ class People {
         std::lock_guard lock(ext.lock);
         auto [it, added] = ext.codes.try_emplace(k, 0);
         if (added) {
-            uint64_t code = table_.size() + uint64_t(ext.names.size()) * 256 + b;
+            uint64_t code = uint64_t(direct_cap_) + table_.size() + uint64_t(ext.names.size()) * 256 + b;
             if (code > UINT32_MAX)
                 throw std::length_error("too many distinct people");
-            it->second = code;
+            it->second = uint32_t(code);
             ext.names.push_back(k);
         }
         return it->second;
     }
     size_t local_bound(unsigned shard) const {
+        size_t base = direct_cap_ >> 8;
         if (overflow_[shard].names.empty())
-            return sizes_[shard].count.load(std::memory_order_relaxed);
-        return table_.size() / 256 + overflow_[shard].names.size();
+            return base + sizes_[shard].count.load(std::memory_order_relaxed);
+        return base + table_.size() / 256 + overflow_[shard].names.size();
     }
     Key name(uint32_t code) const {
-        if (code < table_.size())
-            return names_[(code & 255) * (table_.size() / 256) + (code >> 8)];
-        return overflow_[code & 255].names[(code - table_.size()) / 256];
+        if (code < direct_cap_)
+            return format_direct(code);
+        uint32_t h = code - direct_cap_;
+        if (h < table_.size())
+            return names_[(h & 255) * (table_.size() / 256) + (h >> 8)];
+        return overflow_[h & 255].names[(h - table_.size()) / 256];
     }
 };
 
@@ -417,7 +692,8 @@ struct UserDay {
     Key person;
     int32_t day;
     uint32_t category;
-    int64_t sessions, events, revenue;
+    int32_t sessions, events;
+    int64_t revenue;
 };
 struct Counts {
     int64_t sessions = 0, purchasers = 0, revenue = 0, assists = 0;
