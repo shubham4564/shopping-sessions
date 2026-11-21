@@ -5,10 +5,11 @@ namespace shop {
 #if defined(__AVX2__) && defined(__BMI2__)
 // Check quote pairing and delimiter counts in whole blocks. Return the
 // actual LF offsets so that fast field readers can work on the original mapping.
-template <size_t N> int verify_lines(View input, uint16_t* lines) {
+template <size_t N> int verify_lines(View input, uint16_t* lines, bool& has_quotes) {
     static constexpr auto expected = newline_pattern<N>();
     const char* p = input.data();
     unsigned sep_count = 0, nlines = 0, previous_sep = 1, previous_quote = 0, open_field = p[0] == '"';
+    uint64_t all_q = 0;
     for (unsigned i = 0; i < input.size(); i += 64) {
         const unsigned n = std::min<size_t>(64, input.size() - i);
         const uint64_t valid = low_bits(n);
@@ -38,29 +39,37 @@ template <size_t N> int verify_lines(View input, uint16_t* lines) {
         };
         uint64_t lf = equal('\n'), q = equal('"'), sep = lf | equal(',');
 #endif
+        all_q |= q;
         unsigned ns = std::popcount(sep);
         auto field_bits = low_bits(ns);
         if (_pext_u64(lf, sep) != (expected[sep_count % N] & field_bits))
             return -1;
         char next = i + 64 < input.size() ? p[i + 64] : '\0';
-        uint64_t adjacent_left = (sep << 1) | previous_sep;
-        uint64_t adjacent_right = (sep >> 1) | (uint64_t(next == ',' || next == '\n') << 63);
-        uint64_t endq = (q << 1) | previous_quote;
-        uint64_t startq = _pext_u64((q >> 1) | (uint64_t(next == '"') << 63), sep);
-        if ((q & ~(adjacent_left ^ adjacent_right)) ||
-            ((_pext_u64(endq, sep) ^ ((startq << 1) | open_field)) & field_bits))
-            return -1;
-        if (ns)
-            open_field = (startq >> (ns - 1)) & 1;
+        if (!(q | previous_quote | open_field)) {
+            if (ns)
+                open_field = (sep >> 63) & (next == '"');
+        } else {
+            uint64_t adjacent_left = (sep << 1) | previous_sep;
+            uint64_t adjacent_right = (sep >> 1) | (uint64_t(next == ',' || next == '\n') << 63);
+            uint64_t endq = (q << 1) | previous_quote;
+            uint64_t startq = _pext_u64((q >> 1) | (uint64_t(next == '"') << 63), sep);
+            if ((q & ~(adjacent_left ^ adjacent_right)) ||
+                ((_pext_u64(endq, sep) ^ ((startq << 1) | open_field)) & field_bits))
+                return -1;
+            if (ns)
+                open_field = (startq >> (ns - 1)) & 1;
+        }
         for (uint64_t bits = lf; bits; bits &= bits - 1)
             lines[nlines++] = i + std::countr_zero(bits);
         sep_count += ns;
         previous_sep = sep >> 63;
         previous_quote = q >> 63;
     }
+    has_quotes = (all_q != 0);
     return sep_count == N * nlines ? int(nlines) : -1;
 }
-template <size_t N, class Fast, class Slow> void plain_rows(View chunk, Fast&& fast, Slow&& slow) {
+template <size_t N, class FastNoQ, class FastQ, class Slow>
+void plain_rows_q(View chunk, FastNoQ&& fast_noq, FastQ&& fast_q, Slow&& slow) {
     alignas(64) uint16_t lines[4352];
     while (!chunk.empty()) {
         size_t size = chunk.size();
@@ -69,23 +78,36 @@ template <size_t N, class Fast, class Slow> void plain_rows(View chunk, Fast&& f
             size = lf == View::npos ? size : lf + 1;
         }
         View part = chunk.substr(0, size);
+        bool has_quotes = true;
         int nr = (size <= 4352 && chunk.size() >= size + 128 && part.back() == '\n')
-                     ? verify_lines<N>(part, lines)
+                     ? verify_lines<N>(part, lines, has_quotes)
                      : -1;
         if (nr < 0)
             scalar_rows<N>(part, slow);
         else {
             const char* text = part.data();
             unsigned begin = 0;
-            for (int n = 0; n < nr; ++n) {
-                unsigned end = lines[n];
-                if (!fast(text + begin, text + end))
-                    scalar_rows<N>(View(text + begin, end - begin), slow);
-                begin = end + 1;
+            if (!has_quotes) {
+                for (int n = 0; n < nr; ++n) {
+                    unsigned end = lines[n];
+                    if (!fast_noq(text + begin, text + end))
+                        scalar_rows<N>(View(text + begin, end - begin), slow);
+                    begin = end + 1;
+                }
+            } else {
+                for (int n = 0; n < nr; ++n) {
+                    unsigned end = lines[n];
+                    if (!fast_q(text + begin, text + end))
+                        scalar_rows<N>(View(text + begin, end - begin), slow);
+                    begin = end + 1;
+                }
             }
         }
         chunk.remove_prefix(size);
     }
+}
+template <size_t N, class Fast, class Slow> void plain_rows(View chunk, Fast&& fast, Slow&& slow) {
+    plain_rows_q<N>(chunk, fast, fast, slow);
 }
 #endif
 } // namespace shop

@@ -18,26 +18,11 @@ class People {
     SlotStorage storage_{nullptr, UnmapSlots{0}};
     std::span<Slot> table_;
     std::vector<Component> nodes_;
-    struct alignas(64) ShardSize {
-        std::atomic<uint32_t> count{0};
-    };
-    std::unique_ptr<ShardSize[]> sizes_{new ShardSize[256]};
-    std::unique_ptr<Key[]> names_;
+    std::unique_ptr<uint64_t[]> bloom_;
+    size_t mask_ = 0, bloom_mask_ = 0;
+    bool has_links_ = false;
 
-    uint32_t record_name(size_t slot, Key name) {
-        unsigned shard = slot & 255;
-        uint32_t sequence = sizes_[shard].count.fetch_add(1, std::memory_order_relaxed);
-        names_[shard * (table_.size() / 256) + sequence] = name;
-        return (sequence << 8) | shard;
-    }
-    size_t mask_ = 0, probe_limit_ = 32;
-    struct Overflow {
-        std::mutex lock;
-        std::unordered_map<Key, uint32_t> codes;
-        std::vector<Key> names;
-    };
-    std::unique_ptr<Overflow[]> overflow_{new Overflow[256]};
-    static size_t hash_user(Key k) {
+    static inline size_t hash_user(Key k) {
 #if defined(__SSE4_2__)
         return _mm_crc32_u64(0, k);
 #else
@@ -59,8 +44,6 @@ class People {
         if (mem == MAP_FAILED)
             throw std::bad_alloc();
         madvise(mem, bytes, MADV_HUGEPAGE);
-        // Anonymous pages start at zero. Start the trivial objects' lifetimes
-        // without touching all pages on the graph coordinator thread.
         SlotStorage fresh(::new (mem) Slot[n], UnmapSlots{bytes});
         auto previous = std::move(storage_);
         auto old = table_;
@@ -89,6 +72,45 @@ class People {
         }
         return i;
     }
+    void build_readonly(size_t non_roots, auto&& emit_aliases) {
+        if (!non_roots) {
+            storage_.reset();
+            table_ = {};
+            mask_ = 0;
+            has_links_ = false;
+            return;
+        }
+        size_t n = std::bit_ceil(std::max<size_t>(256, non_roots * 2 + 1));
+        size_t bytes = n * sizeof(Slot);
+        void* mem = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mem == MAP_FAILED)
+            throw std::bad_alloc();
+        madvise(mem, bytes, MADV_HUGEPAGE);
+        SlotStorage fresh(::new (mem) Slot[n], UnmapSlots{bytes});
+        Slot* dst = fresh.get();
+        size_t dst_mask = n - 1;
+
+        // 16 bits per non-root alias (~6% false positive rate), capped at 2 MiB (2^24 bits)
+        size_t bloom_bits = std::clamp<size_t>(std::bit_ceil(non_roots * 16), 4096, size_t(1) << 24);
+        size_t bloom_words = bloom_bits / 64;
+        bloom_.reset(new uint64_t[bloom_words]());
+        bloom_mask_ = bloom_words - 1;
+
+        emit_aliases([&](Key id, Key canon) {
+            size_t h = hash_user(id);
+            bloom_[(h >> 6) & bloom_mask_] |= uint64_t{1} << (h & 63);
+            size_t at = h & dst_mask;
+            while (dst[at].id)
+                at = (at + 1) & dst_mask;
+            dst[at] = {id, canon};
+        });
+
+        storage_ = std::move(fresh);
+        table_ = {storage_.get(), n};
+        mask_ = dst_mask;
+        has_links_ = true;
+    }
+
     bool parallel_links(const Input& links, Keys& keys, unsigned threads) {
         struct Vertex {
             uint32_t slot, root;
@@ -142,8 +164,6 @@ class People {
                             break;
                         Key aid = std::atomic_ref<Key>(table_[a].id).load(std::memory_order_relaxed);
                         Key bid = std::atomic_ref<Key>(table_[b].id).load(std::memory_order_relaxed);
-                        // Every parent is strictly smaller in byte order. A
-                        // concurrent union cannot introduce a cycle.
                         if (keys.less(aid, bid))
                             std::swap(a, b);
                         Key empty = 0;
@@ -155,8 +175,8 @@ class People {
                 n = 0;
             };
             auto add = [&](Key a, Key b) {
-                prefetch(a);
-                prefetch(b);
+                __builtin_prefetch(&table_[hash_user(a) & mask_], 1, 1);
+                __builtin_prefetch(&table_[hash_user(b) & mask_], 1, 1);
                 edges[n++] = {a, b};
                 if (n == edges.size())
                     merge();
@@ -182,7 +202,7 @@ class People {
                 },
                 slow);
 #else
-            rows<2>(links.chunks[chunk],slow);
+            rows<2>(links.chunks[chunk], slow);
 #endif
             merge();
         });
@@ -190,30 +210,33 @@ class People {
             std::fill(table_.begin(), table_.end(), Slot{});
             return false;
         }
+        std::vector<size_t> counts(vertices.size(), 0);
         jobs(vertices.size(), threads, [&](unsigned, size_t i) {
-            for (auto& v : vertices[i])
+            size_t nr = 0;
+            for (auto& v : vertices[i]) {
                 v.root = find_root(v.slot);
-        });
-        names_.reset(new Key[table_.size()]);
-        jobs(vertices.size(), threads, [&](unsigned, size_t i) {
-            for (auto v : vertices[i])
-                if (v.root == v.slot)
-                    table_[v.slot].value = uint64_t(record_name(v.slot, table_[v.slot].id)) + 1;
-        });
-        jobs(vertices.size(), threads, [&](unsigned, size_t i) {
-            for (auto v : vertices[i])
                 if (v.root != v.slot)
-                    table_[v.slot].value = table_[v.root].value;
+                    ++nr;
+            }
+            counts[i] = nr;
         });
-        probe_limit_ = 48;
+        size_t non_roots = 0;
+        for (size_t c : counts)
+            non_roots += c;
+        build_readonly(non_roots, [&](auto&& insert) {
+            for (const auto& vec : vertices)
+                for (auto v : vec)
+                    if (v.root != v.slot)
+                        insert(table_[v.slot].id, table_[v.root].id);
+        });
         return true;
     }
 
   public:
-    People(const Input& links, Keys& keys, size_t log_bytes = 0, unsigned threads = 1) {
-        // The size estimate only affects allocations. Oversized fields cannot
-        // force an excessive initial table size.
-        size_t guess = std::clamp<size_t>(std::max(links.size / 12, log_bytes / 850), 256, 1u << 24);
+    People(const Input& links, Keys& keys, size_t = 0, unsigned threads = 1) {
+        if (!links.size)
+            return;
+        size_t guess = std::clamp<size_t>(links.size / 6, 256, 1u << 24);
         resize(std::bit_ceil(guess));
         if (threads > 1 && links.size > (256u << 10) && parallel_links(links, keys, std::min(threads, 4u)))
             return;
@@ -224,8 +247,8 @@ class People {
         size_t used = 0;
         auto join_batch = [&] {
             for (size_t i = 0; i < used; ++i) {
-                prefetch(edge[i].first);
-                prefetch(edge[i].second);
+                __builtin_prefetch(&table_[hash_user(edge[i].first) & mask_], 0, 1);
+                __builtin_prefetch(&table_[hash_user(edge[i].second) & mask_], 0, 1);
             }
             for (size_t i = 0; i < used; ++i) {
                 refs[i] = {index(edge[i].first), index(edge[i].second)};
@@ -254,68 +277,79 @@ class People {
                 }
             });
         join_batch();
-        names_.reset(new Key[table_.size()]);
-        for (uint32_t i = 0; i < nodes_.size(); ++i)
-            if (nodes_[i].parent == i)
-                nodes_[i].count = record_name(locate(nodes_[i].name), nodes_[i].name);
+        size_t non_roots = 0;
         for (size_t i = 0; i < table_.size(); ++i) {
             auto& slot = table_[i];
             if (!slot.id)
                 continue;
-            slot.value = uint64_t(nodes_[root(static_cast<uint32_t>(slot.value))].count) + 1;
-            probe_limit_ = std::max(probe_limit_, ((i - hash_user(slot.id)) & mask_) + 1);
+            Key canon = nodes_[root(static_cast<uint32_t>(slot.value))].name;
+            slot.value = canon;
+            if (canon != slot.id)
+                ++non_roots;
         }
         std::vector<Component>().swap(nodes_);
+        build_readonly(non_roots, [&](auto&& insert) {
+            for (const auto& slot : table_)
+                if (slot.id && slot.value != slot.id)
+                    insert(slot.id, slot.value);
+        });
     }
-    void prefetch(Key id) const { __builtin_prefetch(&table_[hash_user(id) & mask_], 0, 1); }
-    Key canonical(Key id) const {
-        const auto& slot = table_[locate(id)];
-        return slot.id ? name(slot.value - 1) : id;
+    [[gnu::always_inline]] inline void prefetch(Key id) const {
+        if (has_links_) {
+            size_t h = hash_user(id);
+            __builtin_prefetch(&bloom_[(h >> 6) & bloom_mask_], 0, 1);
+        }
     }
-    // Linked components already have a representative slot. Install isolated
-    // IDs concurrently into empty slots; full-byte keys resolve every collision.
-    uint32_t number(Key k) {
-        size_t hash = hash_user(k), at = hash & mask_;
-        for (size_t probe = 0; probe < probe_limit_; ++probe) {
-            auto& slot = table_[at];
-            std::atomic_ref<Key> id(slot.id);
-            Key seen = id.load(std::memory_order_relaxed);
-            if (!seen && id.compare_exchange_strong(seen, k, std::memory_order_relaxed)) {
-                uint32_t code = record_name(at, k);
-                std::atomic_ref<Key>(slot.value).store(uint64_t(code) + 1, std::memory_order_release);
-                return code;
-            }
-            if (seen == k) {
-                auto value = std::atomic_ref<Key>(slot.value);
-                Key code;
-                while (!(code = value.load(std::memory_order_acquire)))
-                    _mm_pause();
-                return uint32_t(code - 1);
-            }
+    [[gnu::always_inline]] inline Key canonical(Key id) const {
+        if (!has_links_)
+            return id;
+        size_t h = hash_user(id);
+        if (!((bloom_[(h >> 6) & bloom_mask_] >> (h & 63)) & 1))
+            return id;
+        size_t at = h & mask_;
+        while (table_[at].id) {
+            if (table_[at].id == id)
+                return table_[at].value;
             at = (at + 1) & mask_;
         }
-        unsigned b = hash & 255;
-        auto& ext = overflow_[b];
-        std::lock_guard lock(ext.lock);
-        auto [it, added] = ext.codes.try_emplace(k, 0);
-        if (added) {
-            uint64_t code = table_.size() + uint64_t(ext.names.size()) * 256 + b;
-            if (code > UINT32_MAX)
-                throw std::length_error("too many distinct people");
-            it->second = code;
-            ext.names.push_back(k);
+        return id;
+    }
+    // Two-pass MLP batch lookup: pass 1 checks L2 bloom and prefetches L3/DRAM table_
+    // for all potentially aliased keys; pass 2 resolves only those keys in parallel.
+    template <size_t MaxN>
+    inline void batch_canonical(const Key* in, Key* out, size_t n) const {
+        if (!has_links_) {
+            std::memcpy(out, in, n * sizeof(Key));
+            return;
         }
-        return it->second;
-    }
-    size_t local_bound(unsigned shard) const {
-        if (overflow_[shard].names.empty())
-            return sizes_[shard].count.load(std::memory_order_relaxed);
-        return table_.size() / 256 + overflow_[shard].names.size();
-    }
-    Key name(uint32_t code) const {
-        if (code < table_.size())
-            return names_[(code & 255) * (table_.size() / 256) + (code >> 8)];
-        return overflow_[code & 255].names[(code - table_.size()) / 256];
+        size_t hashes[MaxN];
+        uint8_t aliased[MaxN];
+        size_t na = 0;
+        for (size_t i = 0; i < n; ++i) {
+            Key k = in[i];
+            out[i] = k;
+            if (!k)
+                continue;
+            size_t h = hash_user(k);
+            if ((bloom_[(h >> 6) & bloom_mask_] >> (h & 63)) & 1) {
+                __builtin_prefetch(&table_[h & mask_], 0, 1);
+                hashes[na] = h;
+                aliased[na] = uint8_t(i);
+                ++na;
+            }
+        }
+        for (size_t j = 0; j < na; ++j) {
+            size_t i = aliased[j];
+            Key id = in[i];
+            size_t at = hashes[j] & mask_;
+            while (table_[at].id) {
+                if (table_[at].id == id) {
+                    out[i] = table_[at].value;
+                    break;
+                }
+                at = (at + 1) & mask_;
+            }
+        }
     }
 };
 

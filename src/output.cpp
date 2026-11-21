@@ -73,28 +73,52 @@ void Output::append(unsigned part, std::span<const UserDay> rows) {
     char name[9];
     while (!rows.empty()) {
         uint32_t count = std::min<size_t>(rows.size(), file->available());
-        char* dates = v[1].extend(size_t(count) * sizeof(int32_t));
-        char* sessions = v[2].extend(size_t(count) * sizeof(int64_t));
-        char* events = v[3].extend(size_t(count) * sizeof(int64_t));
-        char* revenue = v[4].extend(size_t(count) * sizeof(int64_t));
+        auto* dates = reinterpret_cast<int32_t*>(v[1].extend(size_t(count) * sizeof(int32_t)));
+        auto* sessions = reinterpret_cast<int64_t*>(v[2].extend(size_t(count) * sizeof(int64_t)));
+        auto* events = reinterpret_cast<int64_t*>(v[3].extend(size_t(count) * sizeof(int64_t)));
+        auto* revenue = reinterpret_cast<int64_t*>(v[4].extend(size_t(count) * sizeof(int64_t)));
+        v[0].reserve(v[0].size() + size_t(count) * 16);
+        v[5].reserve(v[5].size() + size_t(count) * 12);
+        char* u0_base = v[0].data();
+        char* u0_ptr = u0_base + v[0].size();
         Key previous = 0;
         View id;
+        char id_buf[16];
+        uint32_t id_total = 0;
         for (uint32_t j = 0; j < count; ++j) {
             const auto& row = rows[j];
             if (previous != row.person) {
                 previous = row.person;
                 id = state_->keys.decode(previous, name);
+                if (id.size() <= 12) {
+                    uint32_t n = uint32_t(id.size());
+                    std::memcpy(id_buf, &n, 4);
+                    std::memcpy(id_buf + 4, id.data(), n);
+                    id_total = 4 + n;
+                } else {
+                    id_total = 0;
+                }
             }
-            v[0].string(id);
-            std::memcpy(dates + j * sizeof(row.day), &row.day, sizeof(row.day));
-            std::memcpy(sessions + j * sizeof(row.sessions), &row.sessions, sizeof(row.sessions));
-            std::memcpy(events + j * sizeof(row.events), &row.events, sizeof(row.events));
-            std::memcpy(revenue + j * sizeof(row.revenue), &row.revenue, sizeof(row.revenue));
+            if (id_total) {
+                std::memcpy(u0_ptr, id_buf, id_total);
+                u0_ptr += id_total;
+            } else {
+                v[0].set_size(size_t(u0_ptr - u0_base));
+                v[0].string(id);
+                v[0].reserve(v[0].size() + size_t(count - j) * 16);
+                u0_base = v[0].data();
+                u0_ptr = u0_base + v[0].size();
+            }
+            dates[j] = row.day;
+            sessions[j] = row.sessions;
+            events[j] = row.events;
+            revenue[j] = row.revenue;
             if (row.category != no_category) {
                 file->defined(j);
                 v[5].string(state_->dim.categories[row.category]);
             }
         }
+        v[0].set_size(size_t(u0_ptr - u0_base));
         rows = rows.subspan(count);
         file->finish_rows(count);
     }

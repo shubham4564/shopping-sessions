@@ -12,11 +12,21 @@ inline uint64_t event_hash(Key key) {
     key = (key ^ (key >> 32)) * 0x9e3779b97f4a7c15ULL;
     return key ^ (key >> 29);
 }
+inline uint64_t person_hash(Key key) {
+#if defined(__SSE4_2__)
+    return _mm_crc32_u64(0, key);
+#else
+    return mix(key);
+#endif
+}
+inline uint32_t person_part(Key key) {
+    return uint32_t(person_hash(key)) & (buckets - 1);
+}
 
 // One producer per arena. Blocks keep row addresses stable throughout global
 // deduplication and avoid copying full partitions whenever a vector grows.
-class Arena {
-    static constexpr size_t page = 32u << 20;
+template <bool HugePage = false> class Arena {
+    static constexpr size_t page = 16u << 20;
     std::vector<void*> slabs_;
     char* current_ = nullptr;
     size_t left_ = 0;
@@ -38,7 +48,8 @@ class Arena {
             void* p = mmap(nullptr, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (p == MAP_FAILED)
                 throw std::bad_alloc();
-            madvise(p, page, MADV_HUGEPAGE);
+            if constexpr (HugePage)
+                madvise(p, page, MADV_HUGEPAGE);
             slabs_.push_back(p);
             current_ = static_cast<char*>(p);
             left_ = page;
@@ -50,7 +61,7 @@ class Arena {
     }
 };
 constexpr unsigned records_per_block = 256;
-template <class T, unsigned count = buckets> class Partitions {
+template <class T, unsigned count = buckets, bool HugePage = false> class Partitions {
     struct Block {
         Block* previous;
         T data[records_per_block];
@@ -59,7 +70,7 @@ template <class T, unsigned count = buckets> class Partitions {
         Block* head = nullptr;
         size_t n = 0;
     };
-    Arena pool_;
+    Arena<HugePage> pool_;
     std::array<Chain, count> chains_{};
     [[gnu::noinline]] void grow(Chain& c) {
         auto* head = static_cast<Block*>(pool_.obtain(sizeof(Block)));
@@ -90,14 +101,65 @@ template <class T, unsigned count = buckets> class Partitions {
     }
 };
 
-struct Hit {
-    uint32_t user, time, purchase;
+struct HitPurchase {
+    uint32_t time, purchase;
+};
+class HitPartitions {
+    static constexpr unsigned cap = records_per_block;
+    struct Block {
+        Block* previous;
+        Key user[cap];
+        uint32_t time[cap];
+    };
+    struct Chain {
+        Block* head = nullptr;
+        size_t n = 0;
+    };
+    Arena<false> pool_;
+    std::array<Chain, buckets> chains_{};
+    [[gnu::noinline]] void grow(Chain& c) {
+        auto* head = static_cast<Block*>(pool_.obtain(sizeof(Block)));
+        head->previous = c.head;
+        c.head = head;
+    }
+
+  public:
+    std::vector<HitPurchase> purchases;
+    [[gnu::always_inline]] inline uint32_t* add(unsigned part, Key user, uint32_t time, uint32_t buy) {
+        Chain& c = chains_[part];
+        unsigned index = c.n++ % cap;
+        if (!index)
+            grow(c);
+        c.head->user[index] = user;
+        uint32_t tval = time;
+        if (buy) {
+            uint32_t idx = uint32_t(purchases.size());
+            purchases.push_back({time, buy});
+            tval = (uint32_t{1} << 31) | idx;
+        }
+        c.head->time[index] = tval;
+        return &c.head->time[index];
+    }
+    template <class F> void blocks(unsigned part, F&& f) {
+        const Chain& c = chains_[part];
+        size_t used = c.n ? (c.n - 1) % cap + 1 : 0;
+        for (Block* b = c.head; b; b = b->previous) {
+            f(b->user, b->time, used);
+            used = cap;
+        }
+    }
+    size_t size(unsigned part) const { return chains_[part].n; }
+    void clear() {
+        chains_ = {};
+        pool_.clear();
+        std::vector<HitPurchase>().swap(purchases);
+    }
 };
 struct Raw {
     Key id;
     union {
         Key user;
-        Hit* emitted;
+        uint32_t* emitted;
     };
     uint64_t data;
 };
@@ -107,7 +169,8 @@ struct Detail {
 };
 struct Ad {
     Key id;
-    uint32_t user, time, campaign;
+    Key user;
+    uint32_t time, campaign;
 };
 using GroupHit = uint64_t;
 struct GroupAd {
@@ -115,9 +178,9 @@ struct GroupAd {
     uint32_t time, campaign;
 };
 struct Lane {
-    Partitions<Raw, id_buckets> input;
-    Partitions<Hit> hits;
-    Partitions<Ad> ads;
+    Partitions<Raw, id_buckets, true> input;
+    HitPartitions hits;
+    Partitions<Ad, buckets, true> ads;
     std::vector<Detail> details;
 };
 constexpr uint32_t detail_bit = uint32_t{1} << 31;
@@ -153,7 +216,7 @@ inline void put_event(const std::array<View, 7>& f, Window w, const Dates& dt, K
     const int64_t ingest = f[3].size() == 20 ? dt.relative_ingest(f[3].data()) : bad_time;
     if (ingest == bad_time)
         return;
-    Key id = keys.encode(f[0]), user = 0;
+    Key id = keys.encode_unordered(f[0]), user = 0;
     uint32_t time = 0, buy = 0;
     int64_t ts = dt.parse(f[2]);
     if (ts >= w.start && ts < w.end && ingest * 1000 <= ts - w.start + day_ms && !f[1].empty() &&
@@ -179,22 +242,23 @@ inline uint32_t commas32(const char* p) {
     return _mm256_movemask_epi8(
         _mm256_cmpeq_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)), _mm256_set1_epi8(',')));
 }
-template <unsigned n>
+template <unsigned n, bool Quoted>
 inline bool plain_event(const char* p, const char* end, unsigned a, unsigned b, Window w, const Dates& dt,
                         Keys& keys, const Dimensions& dim, Lane& lane, unsigned owner) {
-    unsigned qe = *p == '"', qu = p[a + 1] == '"';
+    const unsigned qe = Quoted ? (*p == '"') : 0;
+    const unsigned qu = Quoted ? (p[a + 1] == '"') : 0;
     const char* raw_t = p + b + 1;
-    unsigned qt = *raw_t == '"';
+    const unsigned qt = Quoted ? (*raw_t == '"') : 0;
     const char* t = raw_t + qt;
     if (t + n + qt + 22 > end || t[n + qt] != ',')
         return false;
     const char* raw_i = t + n + qt + 1;
-    unsigned qi = *raw_i == '"';
+    const unsigned qi = Quoted ? (*raw_i == '"') : 0;
     const char* ip = raw_i + qi;
     if (ip + 20 + qi >= end || ip[20 + qi] != ',')
         return false;
     const char* raw_type = ip + 21 + qi;
-    unsigned qkind = *raw_type == '"';
+    const unsigned qkind = Quoted ? (*raw_type == '"') : 0;
     const char* kind = raw_type + qkind;
     int64_t ts, ing;
     if constexpr (n == 20)
@@ -205,12 +269,13 @@ inline bool plain_event(const char* p, const char* end, unsigned a, unsigned b, 
     }
     if (ts == bad_time || ing == bad_time)
         return false;
-    Key id = keys.clean(p + qe, a - 2 * qe), user = 0;
+    Key id = keys.clean_unordered(p + qe, a - 2 * qe), user = 0;
     if (!id)
         return true;
     size_t user_size = b - a - 1 - 2 * qu;
     uint32_t time = 0, buy = 0;
-    if (user_size && ts >= w.start && ts < w.end && ing * 1000 <= ts - w.start + day_ms) {
+    const uint64_t rel_ts = uint64_t(ts - w.start);
+    if (user_size && rel_ts < uint64_t(w.end - w.start) && ing * 1000 <= int64_t(rel_ts) + day_ms) {
         uint32_t tag;
         std::memcpy(&tag, kind, 4);
         if ((tag == 0x77656976u || tag == 0x74726163u) && kind[4 + qkind] == ',') {
@@ -221,7 +286,7 @@ inline bool plain_event(const char* p, const char* end, unsigned a, unsigned b, 
             const char* product = kind + 9 + qkind;
             const char* price = static_cast<const char*>(std::memchr(product, ',', end - product));
             if (price) {
-                unsigned qp = *product == '"', qv = price[1] == '"';
+                const unsigned qp = Quoted ? (*product == '"') : 0, qv = Quoted ? (price[1] == '"') : 0;
                 View product_id(product + qp, price - product - 2 * qp);
                 int64_t cents = decimal(View(price + 1 + qv, end - price - 1 - 2 * qv), 10000000);
                 if (cents > 0 && !product_id.empty()) {
@@ -230,7 +295,7 @@ inline bool plain_event(const char* p, const char* end, unsigned a, unsigned b, 
                 }
             }
         }
-        time = uint32_t(ts - w.start + week_ms);
+        time = uint32_t(rel_ts + uint64_t(week_ms));
     }
     store_event(id, user, ing, time, buy, lane, owner);
     return true;
@@ -245,25 +310,35 @@ inline void parse_events(View chunk, Window w, const Dates& dt, Keys& keys, cons
     };
     std::array<std::array<Line, 32>, 3> batch;
     std::array<unsigned, 3> counts{};
-    auto flush = [&]<unsigned format>() {
+    auto flush_noq = [&]<unsigned format>() {
         constexpr unsigned widths[] = {13, 20, 25};
         for (unsigned i = 0; i < counts[format]; ++i) {
             const Line& x = batch[format][i];
-            if (!plain_event<widths[format]>(x.p, x.end, x.a, x.b, w, dt, keys, dim, lane, owner))
+            if (!plain_event<widths[format], false>(x.p, x.end, x.a, x.b, w, dt, keys, dim, lane, owner))
                 scalar_rows<7>(View(x.p, x.end - x.p), slow);
         }
         counts[format] = 0;
     };
-    auto finish = [&](unsigned f) {
-        if (f == 0)
-            flush.template operator()<0>();
-        else if (f == 1)
-            flush.template operator()<1>();
-        else
-            flush.template operator()<2>();
+    auto finish_noq = [&](unsigned f) {
+        if (f == 0) flush_noq.template operator()<0>();
+        else if (f == 1) flush_noq.template operator()<1>();
+        else flush_noq.template operator()<2>();
     };
-    plain_rows<7>(
+    plain_rows_q<7>(
         chunk,
+        [&](const char* p, const char* end) {
+            uint32_t mask = commas32(p);
+            unsigned a = std::countr_zero(mask), b = std::countr_zero(mask & (mask - 1));
+            if (a == 0 || b >= 32 || end - p < int(b) + 38)
+                return false;
+            const char* t = p + b + 1;
+            unsigned iso = t[4] == '-';
+            unsigned format = iso + (iso & (t[19] != 'Z'));
+            batch[format][counts[format]++] = {p, end, a, b};
+            if (counts[format] == batch[format].size())
+                finish_noq(format);
+            return true;
+        },
         [&](const char* p, const char* end) {
             uint32_t mask = commas32(p);
             unsigned a = std::countr_zero(mask), b = std::countr_zero(mask & (mask - 1));
@@ -272,14 +347,13 @@ inline void parse_events(View chunk, Window w, const Dates& dt, Keys& keys, cons
             const char* t = p + b + 1 + (p[b + 1] == '"');
             unsigned iso = t[4] == '-';
             unsigned format = iso + (iso & (t[19] != 'Z'));
-            batch[format][counts[format]++] = {p, end, a, b};
-            if (counts[format] == batch[format].size())
-                finish(format);
-            return true;
+            if (format == 0) return plain_event<13, true>(p, end, a, b, w, dt, keys, dim, lane, owner);
+            if (format == 1) return plain_event<20, true>(p, end, a, b, w, dt, keys, dim, lane, owner);
+            return plain_event<25, true>(p, end, a, b, w, dt, keys, dim, lane, owner);
         },
         slow);
     for (unsigned i = 0; i < 3; ++i)
-        finish(i);
+        finish_noq(i);
 }
 #endif
 
@@ -293,10 +367,14 @@ inline void parse_clicks(View chunk, Window w, const Dates& dt, Keys& keys, cons
     std::array<Pending, 32> batch;
     size_t n = 0;
     auto flush = [&] {
+        Key in_u[32], out_p[32];
+        for (size_t i = 0; i < n; ++i)
+            in_u[i] = batch[i].user;
+        people.batch_canonical<32>(in_u, out_p, n);
         for (size_t i = 0; i < n; ++i) {
             const auto& r = batch[i];
-            uint32_t name = people.number(r.user);
-            lane.ads.add(name & (buckets - 1), {r.id, name, r.time, r.campaign});
+            Key person = out_p[i];
+            lane.ads.add(person_part(person), {r.id, person, r.time, r.campaign});
         }
         n = 0;
     };
@@ -347,7 +425,8 @@ inline void parse_clicks(View chunk, Window w, const Dates& dt, Keys& keys, cons
     flush();
 }
 
-inline void filter(unsigned part, std::vector<Lane>& lanes, Lane& dst, People& people) {
+inline void filter(unsigned part, std::vector<Lane>& lanes, Lane& dst, const People& people,
+                   std::vector<uint32_t>& table, std::vector<Raw*>& blocks) {
     size_t n = 0;
     for (auto& lane : lanes)
         n += lane.input.size(part);
@@ -357,8 +436,8 @@ inline void filter(unsigned part, std::vector<Lane>& lanes, Lane& dst, People& p
     if (n + lanes.size() * records_per_block + 1 > UINT32_MAX)
         throw std::length_error("event partition too large");
     uint32_t index_mask = std::bit_ceil(uint64_t(n + lanes.size() * records_per_block + 1)) - 1;
-    std::vector<uint32_t> table(mask + 1);
-    std::vector<Raw*> blocks;
+    table.assign(mask + 1, 0);
+    blocks.clear();
     auto each = [&](auto&& f) {
         for (auto& lane : lanes)
             lane.input.blocks(part, f);
@@ -369,41 +448,45 @@ inline void filter(unsigned part, std::vector<Lane>& lanes, Lane& dst, People& p
     auto ingest = [&](const Raw& r) {
         return (uint32_t(r.data) & detail_bit) ? detail(r).ingest : int64_t(int32_t(r.data >> 32));
     };
-    auto emit = [&](Raw& r, Hit* earlier) {
-        Key user = r.user;
-        if (!user) {
-            if (earlier)
-                earlier->time = 0;
+    auto emit_new = [&](Raw& r) {
+        Key person = r.user;
+        if (!person) {
             r.emitted = nullptr;
             return;
         }
-        uint32_t name = people.number(user), time = uint32_t(r.data), buy = 0;
+        uint32_t time = uint32_t(r.data), buy = 0;
         if (time & detail_bit) {
             auto& d = detail(r);
             time = d.time;
             buy = d.purchase;
         }
-        if (earlier && earlier->user == name) {
-            *earlier = {name, time, buy};
-            r.emitted = earlier;
-        } else {
-            if (earlier)
-                earlier->time = 0;
-            r.emitted = &dst.hits.add(name & (buckets - 1), {name, time, buy});
-        }
+        r.emitted = dst.hits.add(person_part(person), person, time, buy);
     };
+    auto emit_replace = [&](Raw& r, uint32_t* earlier) {
+        if (earlier)
+            *earlier = 0;
+        emit_new(r);
+    };
+    constexpr size_t pf_dist = 16;
     each([&](auto block) {
         uint32_t base = uint32_t(blocks.size()) * records_per_block;
         blocks.push_back(block.data());
-        std::array<uint32_t, records_per_block> hashes;
-        for (size_t j = 0; j < block.size(); ++j) {
-            hashes[j] = uint32_t(block[j].id);
-            people.prefetch(block[j].user);
-            __builtin_prefetch(&table[(hashes[j] >> id_bits) & mask], 1, 1);
-        }
-        for (size_t j = 0; j < block.size(); ++j) {
+        const size_t sz = block.size();
+        // Batch-resolve user -> canonical person with 2-pass MLP prefetch before probing table
+        Key raw_u[records_per_block], resolved_u[records_per_block];
+        for (size_t k = 0; k < sz; ++k)
+            raw_u[k] = block[k].user;
+        people.batch_canonical<records_per_block>(raw_u, resolved_u, sz);
+        for (size_t k = 0; k < sz; ++k)
+            block[k].user = resolved_u[k];
+        const size_t init_pf = std::min(sz, pf_dist);
+        for (size_t k = 0; k < init_pf; ++k)
+            __builtin_prefetch(&table[(uint32_t(block[k].id) >> id_bits) & mask], 1, 1);
+        for (size_t j = 0; j < sz; ++j) {
+            if (j + pf_dist < sz)
+                __builtin_prefetch(&table[(uint32_t(block[j + pf_dist].id) >> id_bits) & mask], 1, 1);
             Raw& r = block[j];
-            uint32_t h = hashes[j];
+            uint32_t h = uint32_t(r.id);
             uint32_t tag = uint32_t(r.id >> 32) & ~index_mask;
             uint32_t entry = tag | (base + uint32_t(j) + 1);
             size_t i = (h >> id_bits) & mask;
@@ -411,7 +494,7 @@ inline void filter(unsigned part, std::vector<Lane>& lanes, Lane& dst, People& p
                 uint32_t old = table[i];
                 if (!old) {
                     table[i] = entry;
-                    emit(r, nullptr);
+                    emit_new(r);
                     break;
                 }
                 if ((old & ~index_mask) == tag) {
@@ -419,7 +502,7 @@ inline void filter(unsigned part, std::vector<Lane>& lanes, Lane& dst, People& p
                     auto& previous = blocks[code / records_per_block][code % records_per_block];
                     if (previous.id == r.id) {
                         if (ingest(r) < ingest(previous)) {
-                            emit(r, previous.emitted);
+                            emit_replace(r, previous.emitted);
                             table[i] = entry;
                         }
                         break;
@@ -437,6 +520,10 @@ struct Ranges {
 class Totals {
     uint32_t channels_;
     int32_t first_;
+    uint32_t day_bias_;
+    [[gnu::always_inline]] inline uint32_t day_index(uint32_t t) const {
+        return (t - uint32_t(week_ms) + day_bias_) / uint32_t(day_ms);
+    }
     struct Session {
         uint32_t start, day, end_of_day = 0, best_time = 0, ad = 0;
         Key best_id = 0;
@@ -444,7 +531,7 @@ class Totals {
     };
     std::vector<uint32_t> seen_, touched_, categories_, starts_, slots_;
     std::vector<Session> sessions_;
-    std::vector<uint64_t> masks_;
+    std::vector<uint64_t> masks_, mask1_;
     uint32_t serial_ = 0;
     std::vector<int64_t> amounts_;
     struct Bin {
@@ -460,7 +547,7 @@ class Totals {
     std::vector<uint32_t> day_row_, bin_day_, reset_amounts_;
     std::vector<int64_t> daily_amounts_, best_amount_;
     void bin_person(Key name, std::span<GroupHit> hits, std::span<GroupAd> ads, const Keys& keys,
-                    int64_t origin, std::vector<UserDay>& out) {
+                    int64_t, std::vector<UserDay>& out) {
         const size_t nc = amounts_.size();
         if (bins_.empty()) {
             // The compact path spans fewer than 2^31 milliseconds, so bounded
@@ -508,8 +595,8 @@ class Totals {
                 bits &= bits - 1;
                 auto& bin = bins_[i];
                 if (sessions_.empty() || bin.low - prev > gap_ms) {
-                    int32_t date = utc_day(origin + bin.low);
-                    day = date - first_;
+                    day = day_index(bin.low);
+                    int32_t date = first_ + int32_t(day);
                     if (date != previous_day) {
                         previous_day = date;
                         day_row_[day] = out.size();
@@ -542,53 +629,119 @@ class Totals {
         for (auto i : reset_amounts_)
             daily_amounts_[i] = 0;
         reset_amounts_.clear();
-        attribute(ads, keys);
+        if (ads.empty()) {
+            for (const auto& session : sessions_) {
+                auto& credit = by_day[size_t(session.day) * channels_];
+                ++credit.sessions;
+                credit.purchasers += session.revenue > 0;
+                credit.revenue += session.revenue;
+            }
+        } else {
+            attribute(ads, keys);
+        }
     }
 
   public:
     std::vector<Counts> by_day;
     std::vector<int64_t> assists;
     Totals(const Dimensions& d, Window w)
-        : channels_(d.campaigns.size()), first_(utc_day(w.start)), seen_(channels_),
+        : channels_(d.campaigns.size()), first_(utc_day(w.start)),
+          day_bias_(uint32_t(w.start - int64_t(first_) * day_ms)), seen_(channels_), mask1_(channels_),
           amounts_(d.categories.size()), by_day(size_t(utc_day(w.end - 1) - first_ + 1) * channels_),
           assists(by_day.size()) {}
     void person(Key name, std::span<GroupHit> hits, std::span<GroupAd> ads, const Keys& keys,
                 int64_t origin, std::vector<UserDay>& out) {
-        if (hits.size() >= 48) {
+        const size_t nh = hits.size();
+        if (nh == 1) {
+            uint64_t v = hits[0];
+            uint32_t start = uint32_t(v >> 32), buy = uint32_t(v);
+            uint32_t d = day_index(start);
+            uint32_t cat = buy ? (buy >> 24) : no_category;
+            int64_t rev = buy ? int64_t(buy & 0xffffff) : 0;
+            out.push_back({name, first_ + int32_t(d), cat, 1, 1, rev});
+            size_t day_off = size_t(d) * channels_;
+            uint32_t winner = 0;
+            if (!ads.empty()) {
+                uint32_t best = 0;
+                Key id = 0;
+                if (++serial_ == 0) {
+                    std::fill(seen_.begin(), seen_.end(), 0);
+                    ++serial_;
+                }
+                for (const GroupAd& a : ads) {
+                    if (a.time > start || start - a.time > week_ms)
+                        continue;
+                    if (seen_[a.campaign] != serial_) {
+                        seen_[a.campaign] = serial_;
+                        ++assists[day_off + a.campaign];
+                    }
+                    if (!winner || a.time > best || (a.time == best && keys.less(a.id, id))) {
+                        winner = a.campaign;
+                        best = a.time;
+                        id = a.id;
+                    }
+                }
+            }
+            auto& credit = by_day[day_off + winner];
+            ++credit.sessions;
+            credit.purchasers += rev > 0;
+            credit.revenue += rev;
+            return;
+        }
+        if (nh >= 48) {
             bin_person(name, hits, ads, keys, origin, out);
             return;
         }
-        std::sort(hits.begin(), hits.end());
+        if (nh == 2) {
+            if (hits[1] < hits[0])
+                std::swap(hits[0], hits[1]);
+        } else if (nh <= 24) {
+            for (size_t k = 1; k < nh; ++k) {
+                uint64_t key = hits[k];
+                size_t j = k;
+                while (j > 0 && hits[j - 1] > key) {
+                    hits[j] = hits[j - 1];
+                    --j;
+                }
+                hits[j] = key;
+            }
+        } else {
+            std::sort(hits.begin(), hits.end());
+        }
         sessions_.clear();
         starts_.clear();
         size_t i = 0;
-        int32_t firstday = utc_day(origin + int64_t(hits.front() >> 32));
-        UserDay row{name, firstday, no_category, 0, 0, 0};
+        uint32_t cur_d = day_index(uint32_t(hits.front() >> 32));
+        uint32_t next_day_t = (cur_d + 1) * uint32_t(day_ms) + uint32_t(week_ms) - day_bias_;
+        UserDay row{name, first_ + int32_t(cur_d), no_category, 0, 0, 0};
         auto flush = [&] {
-            int64_t best = 0;
-            for (auto c : categories_) {
-                auto a = amounts_[c];
-                if (a > best || (a == best && c < row.category)) {
-                    best = a;
-                    row.category = c;
+            if (!categories_.empty()) {
+                int64_t best = 0;
+                for (auto c : categories_) {
+                    auto a = amounts_[c];
+                    if (a > best || (a == best && c < row.category)) {
+                        best = a;
+                        row.category = c;
+                    }
+                    amounts_[c] = 0;
                 }
-                amounts_[c] = 0;
+                categories_.clear();
             }
-            categories_.clear();
             out.push_back(row);
         };
-        while (i < hits.size()) {
+        while (i < nh) {
             size_t begin = i;
-            uint32_t start = hits[i] >> 32, prev;
-            int32_t day = utc_day(origin + start);
-            if (day != row.day) {
+            uint32_t start = uint32_t(hits[i] >> 32), prev;
+            if (start >= next_day_t) {
                 flush();
-                row = {name, day, no_category, 0, 0, 0};
+                cur_d = day_index(start);
+                next_day_t = (cur_d + 1) * uint32_t(day_ms) + uint32_t(week_ms) - day_bias_;
+                row = {name, first_ + int32_t(cur_d), no_category, 0, 0, 0};
             }
             int64_t revenue = 0;
             do {
                 uint64_t v = hits[i++];
-                prev = v >> 32;
+                prev = uint32_t(v >> 32);
                 uint32_t buy = uint32_t(v);
                 if (buy) {
                     uint32_t cat = buy >> 24, cents = buy & 0xffffff;
@@ -597,15 +750,23 @@ class Totals {
                     amounts_[cat] += cents;
                     revenue += cents;
                 }
-            } while (i < hits.size() && uint32_t(hits[i] >> 32) - prev <= gap_ms);
+            } while (i < nh && uint32_t(hits[i] >> 32) - prev <= gap_ms);
             ++row.sessions;
             row.events += i - begin;
             row.revenue += revenue;
-            starts_.push_back(start);
-            sessions_.push_back({start, uint32_t(day - first_), 0, 0, 0, 0, revenue});
+            if (ads.empty()) {
+                auto& credit = by_day[size_t(cur_d) * channels_];
+                ++credit.sessions;
+                credit.purchasers += revenue > 0;
+                credit.revenue += revenue;
+            } else {
+                starts_.push_back(start);
+                sessions_.push_back({start, cur_d, 0, 0, 0, 0, revenue});
+            }
         }
         flush();
-        attribute(ads, keys);
+        if (!ads.empty())
+            attribute(ads, keys);
     }
 
   private:
@@ -628,13 +789,15 @@ class Totals {
         if (n == 1) {
             const auto& session = sessions_.front();
             size_t day = size_t(session.day) * channels_;
-            uint32_t winner = 0, best = 0;
-            Key id = 0;
-            if (++serial_ == 0) {
-                std::fill(seen_.begin(), seen_.end(), 0);
-                ++serial_;
-            }
-            for (const GroupAd& a : ads) {
+            uint32_t winner = 0;
+            if (!ads.empty()) {
+                uint32_t best = 0;
+                Key id = 0;
+                if (++serial_ == 0) {
+                    std::fill(seen_.begin(), seen_.end(), 0);
+                    ++serial_;
+                }
+                for (const GroupAd& a : ads) {
                 if (a.time > session.start || session.start - a.time > week_ms)
                     continue;
                 if (seen_[a.campaign] != serial_) {
@@ -646,6 +809,7 @@ class Totals {
                     best = a.time;
                     id = a.id;
                 }
+            }
             }
             auto& credit = by_day[day + winner];
             ++credit.sessions;
@@ -659,7 +823,122 @@ class Totals {
                 ++serial_;
             }
             touched_.clear();
-            if (n > 24) {
+            if (words == 1) {
+                if (n > 24) {
+                    size_t slots = ((starts_.back() - starts_.front()) >> 20) + 1;
+                    slots_.resize(slots);
+                    size_t at = 0;
+                    for (size_t j = 0; j < slots; ++j) {
+                        uint64_t t = starts_.front() + (j << 20);
+                        while (starts_[at] < t)
+                            ++at;
+                        slots_[j] = at;
+                    }
+                }
+#if defined(__AVX512F__)
+                if (n <= 16) {
+                    uint16_t valid_mask = uint16_t((1u << n) - 1u);
+                    __m512i sv = _mm512_mask_loadu_epi32(_mm512_set1_epi32(-1), valid_mask, starts_.data());
+                    for (const GroupAd& ad : ads) {
+                        uint32_t lo = uint32_t(std::popcount(
+                            uint32_t(_mm512_cmplt_epu32_mask(sv, _mm512_set1_epi32(int32_t(ad.time))))));
+                        if (lo == n)
+                            continue;
+                        uint32_t hi_t = ad.time + uint32_t(week_ms);
+                        if (hi_t < starts_[lo])
+                            continue;
+                        uint32_t hi = uint32_t(std::popcount(
+                            uint32_t(_mm512_cmple_epu32_mask(sv, _mm512_set1_epi32(int32_t(hi_t))))));
+                        auto& winner = sessions_[lo];
+                        if (!winner.ad || ad.time > winner.best_time ||
+                            (ad.time == winner.best_time && keys.less(ad.id, winner.best_id))) {
+                            winner.best_time = ad.time;
+                            winner.ad = ad.campaign;
+                            winner.best_id = ad.id;
+                        }
+                        uint64_t range_bits = (~uint64_t{0} << lo) & below(hi);
+                        if (seen_[ad.campaign] != serial_) {
+                            seen_[ad.campaign] = serial_;
+                            touched_.push_back(ad.campaign);
+                            mask1_[ad.campaign] = range_bits;
+                        } else {
+                            mask1_[ad.campaign] |= range_bits;
+                        }
+                    }
+                } else if (n <= 32) {
+                    uint16_t valid_mask = uint16_t((1u << (n - 16)) - 1u);
+                    __m512i sv0 = _mm512_loadu_si512(starts_.data());
+                    __m512i sv1 = _mm512_mask_loadu_epi32(_mm512_set1_epi32(-1), valid_mask, starts_.data() + 16);
+                    for (const GroupAd& ad : ads) {
+                        __m512i vt = _mm512_set1_epi32(int32_t(ad.time));
+                        uint32_t lo = uint32_t(std::popcount(uint32_t(_mm512_cmplt_epu32_mask(sv0, vt)))) +
+                                      uint32_t(std::popcount(uint32_t(_mm512_cmplt_epu32_mask(sv1, vt))));
+                        if (lo == n)
+                            continue;
+                        uint32_t hi_t = ad.time + uint32_t(week_ms);
+                        if (hi_t < starts_[lo])
+                            continue;
+                        __m512i vh = _mm512_set1_epi32(int32_t(hi_t));
+                        uint32_t hi = uint32_t(std::popcount(uint32_t(_mm512_cmple_epu32_mask(sv0, vh)))) +
+                                      uint32_t(std::popcount(uint32_t(_mm512_cmple_epu32_mask(sv1, vh))));
+                        auto& winner = sessions_[lo];
+                        if (!winner.ad || ad.time > winner.best_time ||
+                            (ad.time == winner.best_time && keys.less(ad.id, winner.best_id))) {
+                            winner.best_time = ad.time;
+                            winner.ad = ad.campaign;
+                            winner.best_id = ad.id;
+                        }
+                        uint64_t range_bits = (~uint64_t{0} << lo) & below(hi);
+                        if (seen_[ad.campaign] != serial_) {
+                            seen_[ad.campaign] = serial_;
+                            touched_.push_back(ad.campaign);
+                            mask1_[ad.campaign] = range_bits;
+                        } else {
+                            mask1_[ad.campaign] |= range_bits;
+                        }
+                    }
+                } else
+#endif
+                {
+                    for (const GroupAd& ad : ads) {
+                        uint32_t lo = lower_bound(ad.time);
+                        if (lo == n || uint64_t(ad.time) + week_ms < starts_[lo])
+                            continue;
+                        uint32_t hi = lower_bound(uint64_t(ad.time) + week_ms + 1);
+                        auto& winner = sessions_[lo];
+                        if (!winner.ad || ad.time > winner.best_time ||
+                            (ad.time == winner.best_time && keys.less(ad.id, winner.best_id))) {
+                            winner.best_time = ad.time;
+                            winner.ad = ad.campaign;
+                            winner.best_id = ad.id;
+                        }
+                        uint64_t range_bits = (~uint64_t{0} << lo) & below(hi);
+                        if (seen_[ad.campaign] != serial_) {
+                            seen_[ad.campaign] = serial_;
+                            touched_.push_back(ad.campaign);
+                            mask1_[ad.campaign] = range_bits;
+                        } else {
+                            mask1_[ad.campaign] |= range_bits;
+                        }
+                    }
+                }
+                if (!touched_.empty()) {
+                    for (uint32_t end = n, j = n; j--;) {
+                        if (j + 1 < n && sessions_[j].day != sessions_[j + 1].day)
+                            end = j + 1;
+                        sessions_[j].end_of_day = end;
+                    }
+                    for (uint32_t c : touched_) {
+                        uint64_t bits = mask1_[c];
+                        while (bits) {
+                            const Session& first = sessions_[std::countr_zero(bits)];
+                            uint64_t daymask = below(first.end_of_day);
+                            assists[size_t(first.day) * channels_ + c] += std::popcount(bits & daymask);
+                            bits &= ~daymask;
+                        }
+                    }
+                }
+            } else {
                 size_t slots = ((starts_.back() - starts_.front()) >> 20) + 1;
                 slots_.resize(slots);
                 size_t at = 0;
@@ -669,52 +948,54 @@ class Totals {
                         ++at;
                     slots_[j] = at;
                 }
-            }
-            if (masks_.size() < size_t(channels_) * words)
-                masks_.resize(size_t(channels_) * words);
-            for (const GroupAd& ad : ads) {
-                uint32_t lo = lower_bound(ad.time);
-                if (lo == n || uint64_t(ad.time) + week_ms < starts_[lo])
-                    continue;
-                uint32_t hi = lower_bound(uint64_t(ad.time) + week_ms + 1);
-                auto& winner = sessions_[lo];
-                if (!winner.ad || ad.time > winner.best_time ||
-                    (ad.time == winner.best_time && keys.less(ad.id, winner.best_id))) {
-                    winner.best_time = ad.time;
-                    winner.ad = ad.campaign;
-                    winner.best_id = ad.id;
+                if (masks_.size() < size_t(channels_) * words)
+                    masks_.resize(size_t(channels_) * words);
+                for (const GroupAd& ad : ads) {
+                    uint32_t lo = lower_bound(ad.time);
+                    if (lo == n || uint64_t(ad.time) + week_ms < starts_[lo])
+                        continue;
+                    uint32_t hi = lower_bound(uint64_t(ad.time) + week_ms + 1);
+                    auto& winner = sessions_[lo];
+                    if (!winner.ad || ad.time > winner.best_time ||
+                        (ad.time == winner.best_time && keys.less(ad.id, winner.best_id))) {
+                        winner.best_time = ad.time;
+                        winner.ad = ad.campaign;
+                        winner.best_id = ad.id;
+                    }
+                    uint64_t* m = masks_.data() + size_t(ad.campaign) * words;
+                    if (seen_[ad.campaign] != serial_) {
+                        seen_[ad.campaign] = serial_;
+                        touched_.push_back(ad.campaign);
+                        std::fill_n(m, words, 0);
+                    }
+                    unsigned first = lo / 64, last = (hi - 1) / 64;
+                    uint64_t l = ~uint64_t{0} << (lo & 63), r = below(((hi - 1) & 63) + 1);
+                    if (first == last)
+                        m[first] |= l & r;
+                    else {
+                        m[first] |= l;
+                        std::fill(m + first + 1, m + last, ~uint64_t{0});
+                        m[last] |= r;
+                    }
                 }
-                uint64_t* m = masks_.data() + size_t(ad.campaign) * words;
-                if (seen_[ad.campaign] != serial_) {
-                    seen_[ad.campaign] = serial_;
-                    touched_.push_back(ad.campaign);
-                    std::fill_n(m, words, 0);
-                }
-                unsigned first = lo / 64, last = (hi - 1) / 64;
-                uint64_t l = ~uint64_t{0} << (lo & 63), r = below(((hi - 1) & 63) + 1);
-                if (first == last)
-                    m[first] |= l & r;
-                else {
-                    m[first] |= l;
-                    std::fill(m + first + 1, m + last, ~uint64_t{0});
-                    m[last] |= r;
-                }
-            }
-            for (uint32_t end = n, j = n; j--;) {
-                if (j + 1 < n && sessions_[j].day != sessions_[j + 1].day)
-                    end = j + 1;
-                sessions_[j].end_of_day = end;
-            }
-            for (uint32_t c : touched_) {
-                const uint64_t* m = masks_.data() + size_t(c) * words;
-                for (unsigned j = 0; j < words; ++j) {
-                    uint64_t bits = m[j];
-                    unsigned base = j * 64;
-                    while (bits) {
-                        const Session& first = sessions_[base + std::countr_zero(bits)];
-                        uint64_t daymask = below(std::min(64u, first.end_of_day - base));
-                        assists[size_t(first.day) * channels_ + c] += std::popcount(bits & daymask);
-                        bits &= ~daymask;
+                if (!touched_.empty()) {
+                    for (uint32_t end = n, j = n; j--;) {
+                        if (j + 1 < n && sessions_[j].day != sessions_[j + 1].day)
+                            end = j + 1;
+                        sessions_[j].end_of_day = end;
+                    }
+                    for (uint32_t c : touched_) {
+                        const uint64_t* m = masks_.data() + size_t(c) * words;
+                        for (unsigned j = 0; j < words; ++j) {
+                            uint64_t bits = m[j];
+                            unsigned base = j * 64;
+                            while (bits) {
+                                const Session& first = sessions_[base + std::countr_zero(bits)];
+                                uint64_t daymask = below(std::min(64u, first.end_of_day - base));
+                                assists[size_t(first.day) * channels_ + c] += std::popcount(bits & daymask);
+                                bits &= ~daymask;
+                            }
+                        }
                     }
                 }
             }
@@ -735,8 +1016,14 @@ class Totals {
     }
 };
 
+struct LocalSlot {
+    Key key;
+    uint32_t idx;
+};
 struct GroupBuffers {
     std::vector<Ranges> ranges;
+    std::vector<Key> names;
+    std::vector<LocalSlot> table;
     std::unique_ptr<GroupHit[]> hits;
     std::unique_ptr<GroupAd[]> ads;
     size_t event_capacity = 0, click_capacity = 0;
@@ -748,7 +1035,7 @@ struct GroupBuffers {
     }
 };
 
-inline void aggregate(unsigned part, std::vector<Lane>& lanes, Totals& totals, const People& people,
+inline void aggregate(unsigned part, std::vector<Lane>& lanes, Totals& totals,
                       const Keys& keys, int64_t origin, std::vector<UserDay>& out, GroupBuffers& scratch) {
     size_t nh = 0, na = 0;
     for (auto& lane : lanes) {
@@ -759,16 +1046,82 @@ inline void aggregate(unsigned part, std::vector<Lane>& lanes, Totals& totals, c
         return;
     out.reserve(nh / 8 + 32);
     auto& groups = scratch.ranges;
-    groups.assign(people.local_bound(part), {});
+    auto& names = scratch.names;
+    auto& tbl = scratch.table;
+    groups.clear();
+    names.clear();
+    size_t cap = std::bit_ceil(std::max<size_t>(64, nh / 8 + 64));
+    tbl.assign(cap, {0, 0});
+    size_t mask = cap - 1;
+    auto rehash = [&]() {
+        size_t ncap = cap * 2;
+        size_t nmask = ncap - 1;
+        std::vector<LocalSlot> ntbl(ncap, {0, 0});
+        for (size_t i = 0; i < cap; ++i) {
+            Key k = tbl[i].key;
+            if (k) {
+                size_t at = (person_hash(k) >> bucket_bits) & nmask;
+                while (ntbl[at].key)
+                    at = (at + 1) & nmask;
+                ntbl[at] = tbl[i];
+            }
+        }
+        tbl.swap(ntbl);
+        cap = ncap;
+        mask = nmask;
+    };
     for (auto& lane : lanes) {
-        lane.hits.blocks(part, [&](auto b) {
-            for (auto r : b)
-                if (r.time)
-                    ++groups[r.user >> bucket_bits].ne;
+        lane.hits.blocks(part, [&](Key* users, const uint32_t* times, size_t sz) {
+            for (size_t j = 0; j < sz; ++j) {
+                if (j + 8 < sz)
+                    __builtin_prefetch(&tbl[(person_hash(users[j + 8]) >> bucket_bits) & mask], 1, 1);
+                if (!times[j])
+                    continue;
+                Key k = users[j];
+                size_t at = (person_hash(k) >> bucket_bits) & mask;
+                while (tbl[at].key && tbl[at].key != k)
+                    at = (at + 1) & mask;
+                uint32_t id;
+                if (!tbl[at].key) {
+                    if (groups.size() * 2 >= cap) {
+                        rehash();
+                        at = (person_hash(k) >> bucket_bits) & mask;
+                        while (tbl[at].key)
+                            at = (at + 1) & mask;
+                    }
+                    id = uint32_t(groups.size());
+                    tbl[at] = {k, id};
+                    names.push_back(k);
+                    groups.push_back({1, 0, 0, 0});
+                } else {
+                    id = tbl[at].idx;
+                    ++groups[id].ne;
+                }
+                users[j] = id;
+            }
         });
+    }
+    if (groups.empty())
+        return;
+    for (auto& lane : lanes) {
         lane.ads.blocks(part, [&](auto b) {
-            for (auto r : b)
-                ++groups[r.user >> bucket_bits].nc;
+            const size_t sz = b.size();
+            for (size_t j = 0; j < sz; ++j) {
+                if (j + 8 < sz)
+                    __builtin_prefetch(&tbl[(person_hash(b[j + 8].user) >> bucket_bits) & mask], 0, 1);
+                auto& r = b[j];
+                Key k = r.user;
+                size_t at = (person_hash(k) >> bucket_bits) & mask;
+                while (tbl[at].key && tbl[at].key != k)
+                    at = (at + 1) & mask;
+                if (tbl[at].key) {
+                    uint32_t id = tbl[at].idx;
+                    ++groups[id].nc;
+                    r.user = id;
+                } else {
+                    r.user = UINT64_MAX;
+                }
+            }
         });
     }
     uint32_t e = 0, c = 0;
@@ -783,21 +1136,32 @@ inline void aggregate(unsigned part, std::vector<Lane>& lanes, Totals& totals, c
     GroupBuffers::reserve(hits, scratch.event_capacity, e);
     GroupBuffers::reserve(ads, scratch.click_capacity, c);
     for (auto& lane : lanes) {
-        lane.hits.blocks(part, [&](auto b) {
-            for (auto r : b)
-                if (r.time)
-                    hits[groups[r.user >> bucket_bits].ee++] = (uint64_t(r.time) << 32) | r.purchase;
+        const auto* purch = lane.hits.purchases.data();
+        lane.hits.blocks(part, [&](const Key* users, const uint32_t* times, size_t sz) {
+            for (size_t j = 0; j < sz; ++j) {
+                uint32_t t = times[j];
+                if (!t)
+                    continue;
+                uint64_t packed;
+                if (t & detail_bit) {
+                    const auto& hp = purch[t ^ detail_bit];
+                    packed = (uint64_t(hp.time) << 32) | hp.purchase;
+                } else {
+                    packed = uint64_t(t) << 32;
+                }
+                hits[groups[users[j]].ee++] = packed;
+            }
         });
         lane.ads.blocks(part, [&](auto b) {
-            for (auto r : b)
-                ads[groups[r.user >> bucket_bits].ce++] = {r.id, r.time, r.campaign};
+            for (const auto& r : b)
+                if (r.user != UINT64_MAX)
+                    ads[groups[r.user].ce++] = {r.id, r.time, r.campaign};
         });
     }
     for (size_t i = 0; i < groups.size(); ++i) {
         auto g = groups[i];
-        if (g.ne)
-            totals.person(people.name((i << bucket_bits) | part), {hits.get() + g.ee - g.ne, g.ne},
-                          {ads.get() + g.ce - g.nc, g.nc}, keys, origin, out);
+        totals.person(names[i], {hits.get() + g.ee - g.ne, g.ne},
+                      {ads.get() + g.ce - g.nc, g.nc}, keys, origin, out);
     }
 }
 
@@ -831,9 +1195,11 @@ void run(Input& events, Input& clicks, Input& links, const fs::path& out, Window
     });
     mark("parsed input and links");
     auto& people = *people_future.get();
+    std::vector<std::vector<uint32_t>> filter_tables(workers);
+    std::vector<std::vector<Raw*>> filter_blocks(workers);
     jobs(id_buckets + 1, workers, [&](unsigned t, size_t job) {
         if (job)
-            filter(job - 1, lanes, lanes[t], people);
+            filter(job - 1, lanes, lanes[t], people, filter_tables[t], filter_blocks[t]);
         else {
             events.files.clear();
             clicks.files.clear();
@@ -863,7 +1229,7 @@ void run(Input& events, Input& clicks, Input& links, const fs::path& out, Window
             unsigned part = order[job - workers].second;
             auto& rows = users[t];
             rows.clear();
-            aggregate(part, lanes, totals[t], people, keys, w.start - week_ms, rows, buffers[t]);
+            aggregate(part, lanes, totals[t], keys, w.start - week_ms, rows, buffers[t]);
             writer.append(t, rows);
         }
     });
