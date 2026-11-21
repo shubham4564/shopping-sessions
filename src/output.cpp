@@ -71,17 +71,32 @@ void Output::append(unsigned part, std::span<const UserDay> rows) {
         file = std::make_unique<parquet::File>(state_->temp[part], user_schema);
     auto& v = file->values;
     char name[9];
-    for (const auto& row : rows) {
-        v[0].string(state_->keys.decode(row.person, name));
-        v[1].number(row.day);
-        v[2].number(row.sessions);
-        v[3].number(row.events);
-        v[4].number(row.revenue);
-        if (row.category != no_category) {
-            file->defined();
-            v[5].string(state_->dim.categories[row.category]);
+    while (!rows.empty()) {
+        uint32_t count = std::min<size_t>(rows.size(), file->available());
+        char* dates = v[1].extend(size_t(count) * sizeof(int32_t));
+        char* sessions = v[2].extend(size_t(count) * sizeof(int64_t));
+        char* events = v[3].extend(size_t(count) * sizeof(int64_t));
+        char* revenue = v[4].extend(size_t(count) * sizeof(int64_t));
+        Key previous = 0;
+        View id;
+        for (uint32_t j = 0; j < count; ++j) {
+            const auto& row = rows[j];
+            if (previous != row.person) {
+                previous = row.person;
+                id = state_->keys.decode(previous, name);
+            }
+            v[0].string(id);
+            std::memcpy(dates + j * sizeof(row.day), &row.day, sizeof(row.day));
+            std::memcpy(sessions + j * sizeof(row.sessions), &row.sessions, sizeof(row.sessions));
+            std::memcpy(events + j * sizeof(row.events), &row.events, sizeof(row.events));
+            std::memcpy(revenue + j * sizeof(row.revenue), &row.revenue, sizeof(row.revenue));
+            if (row.category != no_category) {
+                file->defined(j);
+                v[5].string(state_->dim.categories[row.category]);
+            }
         }
-        file->finish_row();
+        rows = rows.subspan(count);
+        file->finish_rows(count);
     }
 }
 void Output::finish(const CampaignDays& totals, unsigned workers) {

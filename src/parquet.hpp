@@ -206,11 +206,17 @@ class File {
         file_.exceptions(std::ios::failbit | std::ios::badbit);
         write("PAR1", 4);
     }
-    void defined() { valid_[n_ >> 3] |= uint8_t(1u << (n_ & 7)); }
-    void finish_row() {
-        if (++n_ == row_group)
+    uint32_t available() const { return row_group - n_; }
+    void defined(uint32_t offset) {
+        uint32_t row = n_ + offset;
+        valid_[row >> 3] |= uint8_t(1u << (row & 7));
+    }
+    void finish_rows(uint32_t count) {
+        n_ += count;
+        if (n_ == row_group)
             flush();
     }
+    void finish_row() { finish_rows(1); }
     void close() {
         flush();
         Bytes footer;
