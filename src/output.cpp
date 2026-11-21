@@ -6,8 +6,8 @@ namespace {
 using namespace parquet;
 constexpr std::array<Field, 6> user_schema{{{"user_id", bytes, utf8},
                                             {"day", i32, date},
-                                            {"sessions", i64},
-                                            {"events", i64},
+                                            {"sessions", i32},
+                                            {"events", i32},
                                             {"revenue_cents", i64},
                                             {"top_category", bytes, utf8, true}}};
 constexpr std::array<Field, 7> campaign_schema{{{"campaign_id", bytes, utf8},
@@ -74,8 +74,8 @@ void Output::append(unsigned part, std::span<const UserDay> rows) {
     while (!rows.empty()) {
         uint32_t count = std::min<size_t>(rows.size(), file->available());
         auto* dates = reinterpret_cast<int32_t*>(v[1].extend(size_t(count) * sizeof(int32_t)));
-        auto* sessions = reinterpret_cast<int64_t*>(v[2].extend(size_t(count) * sizeof(int64_t)));
-        auto* events = reinterpret_cast<int64_t*>(v[3].extend(size_t(count) * sizeof(int64_t)));
+        auto* sessions = reinterpret_cast<int32_t*>(v[2].extend(size_t(count) * sizeof(int32_t)));
+        auto* events = reinterpret_cast<int32_t*>(v[3].extend(size_t(count) * sizeof(int32_t)));
         auto* revenue = reinterpret_cast<int64_t*>(v[4].extend(size_t(count) * sizeof(int64_t)));
         v[0].reserve(v[0].size() + size_t(count) * 16);
         v[5].reserve(v[5].size() + size_t(count) * 12);

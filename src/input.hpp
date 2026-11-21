@@ -319,8 +319,6 @@ public:
 #endif
         return encode(View(p,n));
     }
-    // Bijective encoding for equality-only keys (event_id): avoids bswap64.
-    // All 1..9 byte nonzero ASCII strings map injectively into bits 0..62 (bit 63 = 0).
     Key clean_unordered(const char* p, size_t n) {
 #if defined(__BMI2__)
         if (n <= 9) {

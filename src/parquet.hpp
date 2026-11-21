@@ -133,7 +133,7 @@ class File {
         int64_t total = 0, encoded = 0;
         std::vector<Column> cols;
     };
-    int fd_ = -1;
+    std::ofstream file_;
     std::span<const Field> schema_;
     std::vector<Group> groups_;
     int64_t offset_ = 0, rows_ = 0;
@@ -141,18 +141,8 @@ class File {
     std::vector<uint8_t> valid_;
     uint32_t n_ = 0;
     void write(const void* p, size_t n) {
-        const char* cur = static_cast<const char*>(p);
-        size_t rem = n;
-        while (rem) {
-            ssize_t w = ::write(fd_, cur, rem);
-            if (w <= 0) {
-                if (w < 0 && errno == EINTR)
-                    continue;
-                throw std::runtime_error("Parquet write failed");
-            }
-            cur += w;
-            rem -= size_t(w);
-        }
+        if (n)
+            file_.write(static_cast<const char*>(p), n);
         offset_ += n;
     }
     void page(Group& group, unsigned col) {
@@ -175,10 +165,10 @@ class File {
         const char* data = raw->data();
         unsigned codec = 0;
         int encoded = size;
-        if (field.type != bytes && size >= 128 && bound > 0) {
+        if (size >= 128 && bound > 0) {
             compressed_.clear();
             auto* dest = compressed_.extend(bound);
-            int used = LZ4_compress_fast(data, dest, size, bound, 64);
+            int used = LZ4_compress_fast(data, dest, size, bound, 16);
             if (used > 0 && used < size) {
                 data = dest;
                 encoded = used;
@@ -222,15 +212,10 @@ class File {
     static constexpr unsigned row_group = 65536;
     std::vector<Bytes> values;
     File(const fs::path& path, std::span<const Field> schema)
-        : schema_(schema), valid_((row_group + 7) / 8), values(schema.size()) {
-        fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-        if (fd_ < 0)
-            throw std::runtime_error("cannot open " + path.string());
+        : file_(path, std::ios::binary), schema_(schema), valid_((row_group + 7) / 8),
+          values(schema.size()) {
+        file_.exceptions(std::ios::failbit | std::ios::badbit);
         write("PAR1", 4);
-    }
-    ~File() {
-        if (fd_ >= 0)
-            ::close(fd_);
     }
     uint32_t available() const { return row_group - n_; }
     void defined(uint32_t offset) {
@@ -294,7 +279,7 @@ class File {
         write(footer.data(), size);
         write(&size, 4);
         write("PAR1", 4);
-        if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+        file_.close();
     }
 };
 } // namespace shop::parquet

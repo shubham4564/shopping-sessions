@@ -50,33 +50,43 @@ class Dates {
     // The grammar is identical to parse(). All padded calls originate in a
     // structurally checked block with at least 128 readable bytes after it.
     int64_t padded(const char* p, unsigned n) const {
+#if defined(__SSSE3__) && defined(__SSE4_1__)
         if (n == 13) {
-            uint64_t first = read64(p), last = read64(p + 5);
-            if (digits8(first) && digits8(last))
-                return int64_t(number8(first)) * 100000 + number8(last) % 100000;
-            return bad_time;
+            auto d = _mm_slli_si128(
+                _mm_sub_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)), _mm_set1_epi8('0')), 3);
+            auto invalid = _mm_subs_epu8(d, _mm_set1_epi8(9));
+            if (!_mm_testz_si128(invalid, invalid))
+                return bad_time;
+            auto pairs = _mm_maddubs_epi16(d, _mm_set1_epi16(0x010a));
+            auto quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x00010064));
+            auto eight = _mm_madd_epi16(_mm_packus_epi32(quads, quads), _mm_set1_epi32(0x00012710));
+            return int64_t(_mm_cvtsi128_si32(eight)) * 100000000 + _mm_extract_epi32(eight, 1);
         }
         if (n == 20 || n == 25) {
             const Month& m = months_[p[6] & 15];
             if (read64(p) != m.prefix)
                 return timestamp(View(p, n));
-            unsigned day = digits_[read16(p + 8)], h = digits_[read16(p + 11)],
-                     min = digits_[read16(p + 14)], sec = digits_[read16(p + 17)];
-            if (p[10] != 'T' || p[13] != ':' || p[16] != ':' || (day - 1u) >= m.days ||
-                h >= 24u || min >= 60u || sec >= 60u)
+            auto digits = clock_digits(p);
+            auto invalid = _mm_subs_epu8(digits, _mm_set1_epi8(9));
+            auto pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+            auto limit = _mm_setr_epi16(m.days, 23, 59, 59, 0, 0, 0, 0);
+            auto ranges = _mm_or_si128(invalid, _mm_cmpgt_epi16(pairs, limit));
+            if (!_mm_testz_si128(ranges, ranges) || !_mm_extract_epi16(pairs, 0) || p[10] != 'T' ||
+                p[13] != ':' || p[16] != ':')
                 return bad_time;
-            int offset = 0;
+            int sec = clock_seconds(pairs);
             if (n == 20) {
                 if (p[19] != 'Z')
                     return bad_time;
             } else {
-                unsigned oh = digits_[read16(p + 20)], om = digits_[read16(p + 23)];
-                if ((p[19] != '+' && p[19] != '-') || p[22] != ':' || oh >= 24u || om >= 60u)
+                int oh = digits_[read16(p + 20)], om = digits_[read16(p + 23)];
+                if ((p[19] != '+' && p[19] != '-') || p[22] != ':' || oh >= 24 || om >= 60)
                     return bad_time;
-                offset = int(oh * 60 + om) * (p[19] == '-' ? -1 : 1);
+                sec -= (oh * 60 + om) * (p[19] == '-' ? -60 : 60);
             }
-            return m.base + (int64_t(day) * 86400 + int64_t((int(h) * 60 + int(min) - offset) * 60 + int(sec))) * 1000;
+            return m.base + int64_t(sec) * 1000;
         }
+#endif
         return parse(View(p, n));
     }
 #if defined(__AVX2__)
@@ -89,17 +99,26 @@ class Dates {
             ing = relative_ingest(ingest);
             return;
         }
-        unsigned d = digits_[read16(event + 8)], h = digits_[read16(event + 11)],
-                 mi = digits_[read16(event + 14)], s = digits_[read16(event + 17)];
-        unsigned id = digits_[read16(ingest + 8)], ih = digits_[read16(ingest + 11)],
-                 imi = digits_[read16(ingest + 14)], is = digits_[read16(ingest + 17)];
-        ing = m.relative_seconds + int64_t(id) * 86400 + int64_t((ih * 60 + imi) * 60 + is);
-        if ((d - 1u) >= m.days || h >= 24u || mi >= 60u || s >= 60u ||
-            event[10] != 'T' || event[13] != ':' || event[16] != ':' || event[19] != 'Z') {
+        auto first = _mm_loadu_si128(reinterpret_cast<const __m128i*>(event + 4));
+        auto second = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ingest + 4));
+        auto clocks = _mm256_inserti128_si256(_mm256_castsi128_si256(first), second, 1);
+        auto raw = _mm256_sub_epi8(clocks, _mm256_set1_epi8('0'));
+        auto order = _mm_setr_epi8(4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, -1, -1);
+        auto digits = _mm256_shuffle_epi8(raw, _mm256_broadcastsi128_si256(order));
+        auto pairs = _mm256_maddubs_epi16(digits, _mm256_set1_epi16(0x010a));
+        auto event_pairs = _mm256_castsi256_si128(pairs);
+        auto limits = _mm_setr_epi16(m.days, 23, 59, 59, 0, 0, 0, 0);
+        auto invalid = _mm_or_si128(_mm_subs_epu8(_mm256_castsi256_si128(digits), _mm_set1_epi8(9)),
+                                    _mm_cmpgt_epi16(event_pairs, limits));
+        auto factors = _mm_setr_epi16(24, 1, 60, 1, 0, 0, 0, 0);
+        auto totals = _mm256_madd_epi16(pairs, _mm256_broadcastsi128_si256(factors));
+        auto scaled = _mm256_mullo_epi32(totals, _mm256_setr_epi32(3600, 1, 0, 0, 3600, 1, 0, 0));
+        auto seconds = _mm256_add_epi32(scaled, _mm256_srli_si256(scaled, 4));
+        ing = m.relative_seconds + _mm256_extract_epi32(seconds, 4);
+        ts = m.base + int64_t(_mm256_extract_epi32(seconds, 0)) * 1000;
+        if (!_mm_testz_si128(invalid, invalid) || !_mm_extract_epi16(event_pairs, 0) ||
+            event[10] != 'T' || event[13] != ':' || event[16] != ':' || event[19] != 'Z')
             ts = bad_time;
-            return;
-        }
-        ts = m.base + (int64_t(d) * 86400 + int64_t((h * 60 + mi) * 60 + s)) * 1000;
     }
 #endif
     explicit Dates(Window w) : window_seconds_(w.start / 1000) {
@@ -151,8 +170,13 @@ class Dates {
             int64_t ms = timestamp(View(p, 20));
             return ms == bad_time ? bad_time : ms / 1000 - window_seconds_;
         }
+#if defined(__SSSE3__) && defined(__SSE4_1__)
+        auto pairs = _mm_maddubs_epi16(clock_digits(p), _mm_set1_epi16(0x010a));
+        return m.relative_seconds + clock_seconds(pairs);
+#else
         return m.relative_seconds + int64_t(digits_[read16(p + 8)]) * 86400 +
                (digits_[read16(p + 11)] * 60 + digits_[read16(p + 14)]) * 60 + digits_[read16(p + 17)];
+#endif
     }
     int64_t ingest(const char* p) const {
         int64_t delta = relative_ingest(p);
