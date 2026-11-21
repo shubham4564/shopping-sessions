@@ -49,11 +49,11 @@ class Arena {
         return p;
     }
 };
+constexpr unsigned records_per_block = 256;
 template <class T, unsigned count = buckets> class Partitions {
-    static constexpr unsigned capacity = 128;
     struct Block {
         Block* previous;
-        T data[capacity];
+        T data[records_per_block];
     };
     struct Chain {
         Block* head = nullptr;
@@ -70,17 +70,17 @@ template <class T, unsigned count = buckets> class Partitions {
   public:
     [[gnu::always_inline]] inline T& add(unsigned part, const T& row) {
         Chain& c = chains_[part];
-        unsigned index = c.n++ % capacity;
+        unsigned index = c.n++ % records_per_block;
         if (!index)
             grow(c);
         return c.head->data[index] = row;
     }
     template <class F> void blocks(unsigned part, F&& f) {
         const Chain& c = chains_[part];
-        size_t used = c.n ? (c.n - 1) % capacity + 1 : 0;
+        size_t used = c.n ? (c.n - 1) % records_per_block + 1 : 0;
         for (Block* b = c.head; b; b = b->previous) {
             f(std::span<T>(b->data, used));
-            used = capacity;
+            used = records_per_block;
         }
     }
     size_t size(unsigned part) const { return chains_[part].n; }
@@ -354,9 +354,9 @@ inline void filter(unsigned part, std::vector<Lane>& lanes, Lane& dst, People& p
     if (!n)
         return;
     size_t mask = std::bit_ceil(n * 2) - 1;
-    if (n + lanes.size() * 128 + 1 > UINT32_MAX)
+    if (n + lanes.size() * records_per_block + 1 > UINT32_MAX)
         throw std::length_error("event partition too large");
-    uint32_t index_mask = std::bit_ceil(uint64_t(n + lanes.size() * 128 + 1)) - 1;
+    uint32_t index_mask = std::bit_ceil(uint64_t(n + lanes.size() * records_per_block + 1)) - 1;
     std::vector<uint32_t> table(mask + 1);
     std::vector<Raw*> blocks;
     auto each = [&](auto&& f) {
@@ -393,9 +393,9 @@ inline void filter(unsigned part, std::vector<Lane>& lanes, Lane& dst, People& p
         }
     };
     each([&](auto block) {
-        uint32_t base = uint32_t(blocks.size()) * 128;
+        uint32_t base = uint32_t(blocks.size()) * records_per_block;
         blocks.push_back(block.data());
-        std::array<uint32_t, 128> hashes;
+        std::array<uint32_t, records_per_block> hashes;
         for (size_t j = 0; j < block.size(); ++j) {
             hashes[j] = uint32_t(block[j].id);
             people.prefetch(block[j].user);
@@ -416,7 +416,7 @@ inline void filter(unsigned part, std::vector<Lane>& lanes, Lane& dst, People& p
                 }
                 if ((old & ~index_mask) == tag) {
                     uint32_t code = (old & index_mask) - 1;
-                    auto& previous = blocks[code / 128][code % 128];
+                    auto& previous = blocks[code / records_per_block][code % records_per_block];
                     if (previous.id == r.id) {
                         if (ingest(r) < ingest(previous)) {
                             emit(r, previous.emitted);
