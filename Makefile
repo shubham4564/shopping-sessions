@@ -1,5 +1,5 @@
 CXX ?= g++
-CXXFLAGS ?= -O3 -DNDEBUG
+CXXFLAGS ?= -O3 -DNDEBUG -flto
 PYTHON ?= python3
 IMAGE ?= shopping-sessions:latest
 PLATFORM ?= linux/amd64

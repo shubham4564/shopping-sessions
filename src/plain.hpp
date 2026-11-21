@@ -72,9 +72,35 @@ template <size_t N, class Fast, class Slow> void plain_rows(View chunk, Fast&& f
         int nr = (size <= 4352 && chunk.size() >= size + 128 && part.back() == '\n')
                      ? verify_lines<N>(part, lines)
                      : -1;
-        if (nr < 0)
-            scalar_rows<N>(part, slow);
-        else {
+        if (nr < 0) {
+            if (part.size() > 1024 && chunk.size() >= size + 128 && part.back() == '\n') {
+                View rem = part;
+                while (!rem.empty()) {
+                    size_t sub = rem.size();
+                    if (sub > 1024) {
+                        auto lf = rem.find('\n', 1023);
+                        sub = lf == View::npos ? sub : lf + 1;
+                    }
+                    View sp = rem.substr(0, sub);
+                    int snr = (sub <= 4352 && sp.back() == '\n') ? verify_lines<N>(sp, lines) : -1;
+                    if (snr < 0)
+                        scalar_rows<N>(sp, slow);
+                    else {
+                        const char* text = sp.data();
+                        unsigned begin = 0;
+                        for (int n = 0; n < snr; ++n) {
+                            unsigned end = lines[n];
+                            if (!fast(text + begin, text + end))
+                                scalar_rows<N>(View(text + begin, end - begin), slow);
+                            begin = end + 1;
+                        }
+                    }
+                    rem.remove_prefix(sub);
+                }
+            } else {
+                scalar_rows<N>(part, slow);
+            }
+        } else {
             const char* text = part.data();
             unsigned begin = 0;
             for (int n = 0; n < nr; ++n) {

@@ -16,6 +16,12 @@ class People {
     };
     using SlotStorage = std::unique_ptr<Slot[], UnmapSlots>;
     SlotStorage storage_{nullptr, UnmapSlots{0}};
+    SlotStorage remap_storage_{nullptr, UnmapSlots{0}};
+    Slot* remap_table_ = nullptr;
+    size_t remap_mask_ = 0;
+    std::vector<uint64_t> remap_bloom_;
+    size_t bloom_word_mask_ = 0;
+    bool has_remaps_ = false;
     std::span<Slot> table_;
     std::vector<Component> nodes_;
     struct alignas(64) ShardSize {
@@ -89,7 +95,7 @@ class People {
         }
         return i;
     }
-    bool parallel_links(const Input& links, Keys& keys, unsigned threads) {
+    bool parallel_links(const Input& links, Keys& keys, unsigned threads, bool remap_only) {
         struct Vertex {
             uint32_t slot, root;
         };
@@ -194,28 +200,65 @@ class People {
             for (auto& v : vertices[i])
                 v.root = find_root(v.slot);
         });
-        names_.reset(new Key[table_.size()]);
-        jobs(vertices.size(), threads, [&](unsigned, size_t i) {
-            for (auto v : vertices[i])
-                if (v.root == v.slot)
-                    table_[v.slot].value = uint64_t(record_name(v.slot, table_[v.slot].id)) + 1;
-        });
-        jobs(vertices.size(), threads, [&](unsigned, size_t i) {
-            for (auto v : vertices[i])
+        if (!remap_only) {
+            names_.reset(new Key[table_.size()]);
+            jobs(vertices.size(), threads, [&](unsigned, size_t i) {
+                for (auto v : vertices[i])
+                    if (v.root == v.slot)
+                        table_[v.slot].value = uint64_t(record_name(v.slot, table_[v.slot].id)) + 1;
+            });
+            jobs(vertices.size(), threads, [&](unsigned, size_t i) {
+                for (auto v : vertices[i])
+                    if (v.root != v.slot)
+                        table_[v.slot].value = table_[v.root].value;
+            });
+        }
+        size_t n_remap = 0;
+        for (const auto& vv : vertices)
+            for (auto v : vv)
                 if (v.root != v.slot)
-                    table_[v.slot].value = table_[v.root].value;
-        });
+                    ++n_remap;
+        if (n_remap) {
+            has_remaps_ = true;
+            size_t rcap = std::bit_ceil(std::max<size_t>(256, n_remap * 2 + 1));
+            size_t rbytes = rcap * sizeof(Slot);
+            void* rmem = mmap(nullptr, rbytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (rmem != MAP_FAILED) {
+                madvise(rmem, rbytes, MADV_HUGEPAGE);
+                remap_storage_ = SlotStorage(::new (rmem) Slot[rcap], UnmapSlots{rbytes});
+                remap_table_ = remap_storage_.get();
+                remap_mask_ = rcap - 1;
+                size_t bbits = std::clamp<size_t>(std::bit_ceil(n_remap * 8 + 64), 4096, 16u << 20);
+                size_t bwords = bbits >> 6;
+                remap_bloom_.assign(bwords, 0);
+                bloom_word_mask_ = bwords - 1;
+                for (const auto& vv : vertices) {
+                    for (auto v : vv) {
+                        if (v.root != v.slot) {
+                            Key id = table_[v.slot].id;
+                            Key canon = table_[v.root].id;
+                            size_t h = hash_user(id);
+                            remap_bloom_[(h >> 6) & bloom_word_mask_] |= uint64_t{1} << (h & 63);
+                            size_t at = h & remap_mask_;
+                            while (remap_table_[at].id)
+                                at = (at + 1) & remap_mask_;
+                            remap_table_[at] = {id, canon};
+                        }
+                    }
+                }
+            }
+        }
         probe_limit_ = 48;
         return true;
     }
 
   public:
-    People(const Input& links, Keys& keys, size_t log_bytes = 0, unsigned threads = 1) {
+    People(const Input& links, Keys& keys, size_t log_bytes = 0, unsigned threads = 1, bool remap_only = false) {
         // The size estimate only affects allocations. Oversized fields cannot
         // force an excessive initial table size.
         size_t guess = std::clamp<size_t>(std::max(links.size / 12, log_bytes / 850), 256, 1u << 24);
         resize(std::bit_ceil(guess));
-        if (threads > 1 && links.size > (256u << 10) && parallel_links(links, keys, std::min(threads, 4u)))
+        if (threads > 1 && links.size > (256u << 10) && parallel_links(links, keys, std::min(threads, 4u), remap_only))
             return;
         nodes_.reserve(std::min(guess, links.size / 12 + 16));
         using Edge = std::pair<Key, Key>;
@@ -265,9 +308,69 @@ class People {
             slot.value = uint64_t(nodes_[root(static_cast<uint32_t>(slot.value))].count) + 1;
             probe_limit_ = std::max(probe_limit_, ((i - hash_user(slot.id)) & mask_) + 1);
         }
+        size_t n_remap = 0;
+        for (size_t i = 0; i < table_.size(); ++i) {
+            auto& slot = table_[i];
+            if (slot.id && name(slot.value - 1) != slot.id)
+                ++n_remap;
+        }
+        if (n_remap) {
+            has_remaps_ = true;
+            size_t rcap = std::bit_ceil(std::max<size_t>(256, n_remap * 2 + 1));
+            size_t rbytes = rcap * sizeof(Slot);
+            void* rmem = mmap(nullptr, rbytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (rmem != MAP_FAILED) {
+                madvise(rmem, rbytes, MADV_HUGEPAGE);
+                remap_storage_ = SlotStorage(::new (rmem) Slot[rcap], UnmapSlots{rbytes});
+                remap_table_ = remap_storage_.get();
+                remap_mask_ = rcap - 1;
+                size_t bbits = std::clamp<size_t>(std::bit_ceil(n_remap * 8 + 64), 4096, 16u << 20);
+                size_t bwords = bbits >> 6;
+                remap_bloom_.assign(bwords, 0);
+                bloom_word_mask_ = bwords - 1;
+                for (size_t i = 0; i < table_.size(); ++i) {
+                    auto& slot = table_[i];
+                    if (!slot.id) continue;
+                    Key canon = name(slot.value - 1);
+                    if (canon == slot.id) continue;
+                    size_t h = hash_user(slot.id);
+                    remap_bloom_[(h >> 6) & bloom_word_mask_] |= uint64_t{1} << (h & 63);
+                    size_t at = h & remap_mask_;
+                    while (remap_table_[at].id)
+                        at = (at + 1) & remap_mask_;
+                    remap_table_[at] = {slot.id, canon};
+                }
+            }
+        }
         std::vector<Component>().swap(nodes_);
     }
     void prefetch(Key id) const { __builtin_prefetch(&table_[hash_user(id) & mask_], 0, 1); }
+    static inline size_t user_hash(Key k) { return hash_user(k); }
+    void release_global_table() {
+        storage_.reset();
+        table_ = {};
+        names_.reset();
+    }
+    [[gnu::always_inline]] inline void prefetch_bloom(Key k) const {
+        if (has_remaps_) [[likely]] {
+            size_t h = hash_user(k);
+            __builtin_prefetch(&remap_bloom_[(h >> 6) & bloom_word_mask_], 0, 1);
+        }
+    }
+    [[gnu::always_inline]] inline Key canonical_fast(Key k) const {
+        if (!has_remaps_) [[unlikely]]
+            return k;
+        size_t h = hash_user(k);
+        if (!((remap_bloom_[(h >> 6) & bloom_word_mask_] >> (h & 63)) & 1ULL)) [[likely]]
+            return k;
+        size_t at = h & remap_mask_;
+        for (;;) {
+            Key id = remap_table_[at].id;
+            if (!id) return k;
+            if (id == k) return remap_table_[at].value;
+            at = (at + 1) & remap_mask_;
+        }
+    }
     Key canonical(Key id) const {
         const auto& slot = table_[locate(id)];
         return slot.id ? name(slot.value - 1) : id;
@@ -417,7 +520,8 @@ struct UserDay {
     Key person;
     int32_t day;
     uint32_t category;
-    int64_t sessions, events, revenue;
+    int32_t sessions, events;
+    int64_t revenue;
 };
 struct Counts {
     int64_t sessions = 0, purchasers = 0, revenue = 0, assists = 0;
