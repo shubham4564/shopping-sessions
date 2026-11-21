@@ -1,0 +1,7 @@
+/build/
+/dev/
+/out/
+/dev-answer/
+/starter-*/
+/generator/
+*.zip
