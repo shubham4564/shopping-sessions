@@ -280,6 +280,13 @@ class People {
             auto& slot = table_[at];
             std::atomic_ref<Key> id(slot.id);
             Key seen = id.load(std::memory_order_relaxed);
+            if (seen == k) [[likely]] {
+                auto value = std::atomic_ref<Key>(slot.value);
+                Key code;
+                while (!(code = value.load(std::memory_order_acquire))) [[unlikely]]
+                    _mm_pause();
+                return uint32_t(code - 1);
+            }
             if (!seen && id.compare_exchange_strong(seen, k, std::memory_order_relaxed)) {
                 uint32_t code = record_name(at, k);
                 std::atomic_ref<Key>(slot.value).store(uint64_t(code) + 1, std::memory_order_release);
@@ -417,7 +424,8 @@ struct UserDay {
     Key person;
     int32_t day;
     uint32_t category;
-    int64_t sessions, events, revenue;
+    int32_t sessions, events;
+    int64_t revenue;
 };
 struct Counts {
     int64_t sessions = 0, purchasers = 0, revenue = 0, assists = 0;

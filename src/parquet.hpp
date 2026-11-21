@@ -18,6 +18,17 @@ class Bytes {
     size_t size() const { return size_; }
     char* data() const { return bytes_.get(); }
     void clear() { size_ = 0; }
+    void reserve(size_t total) {
+        if (total > capacity_) {
+            size_t capacity = std::max({total, capacity_ * 2, size_t(256)});
+            std::unique_ptr<char[]> next(new char[capacity]);
+            if (size_)
+                std::memcpy(next.get(), bytes_.get(), size_);
+            bytes_ = std::move(next);
+            capacity_ = capacity;
+        }
+    }
+    void set_size(size_t s) { size_ = s; }
     char* extend(size_t n) {
         if (n > capacity_ - size_) {
             size_t capacity = std::max({size_ + n, capacity_ * 2, size_t(256)});
@@ -157,7 +168,7 @@ class File {
         if (size >= 128 && bound > 0) {
             compressed_.clear();
             auto* dest = compressed_.extend(bound);
-            int used = LZ4_compress_fast(data, dest, size, bound, 3);
+            int used = LZ4_compress_fast(data, dest, size, bound, 16);
             if (used > 0 && used < size) {
                 data = dest;
                 encoded = used;
@@ -198,7 +209,7 @@ class File {
     }
 
   public:
-    static constexpr unsigned row_group = 32768;
+    static constexpr unsigned row_group = 65536;
     std::vector<Bytes> values;
     File(const fs::path& path, std::span<const Field> schema)
         : file_(path, std::ios::binary), schema_(schema), valid_((row_group + 7) / 8),
